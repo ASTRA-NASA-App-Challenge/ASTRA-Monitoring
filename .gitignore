@@ -396,7 +396,10 @@ healthchecksdb
 
 # Local monitoring databases and captured photos
 *.db
+*.db-shm
+*.db-wal
 App_Data/photos/
+.demo-credentials.json
 
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/

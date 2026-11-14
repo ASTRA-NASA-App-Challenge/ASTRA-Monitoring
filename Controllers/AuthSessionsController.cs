@@ -29,25 +29,26 @@ public sealed class AuthSessionsController(
     public IActionResult Health() => Ok(new { status = "ok", api_version = "v1", time = DateTime.UtcNow });
 
     [HttpGet("astronauts")]
+    [AllowAnonymous]
     [EnableRateLimiting("device-read")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Device)]
     public async Task<IActionResult> Astronauts([FromQuery] bool active = true, [FromQuery] int limit = 50,
         [FromQuery] string? cursor = null, [FromQuery] string? query = null)
     {
-        if (User.FindFirstValue("device_kind") != "uno") return Forbid();
         limit = Math.Clamp(limit, 1, 100);
-        var ids = JsonSerializer.Deserialize<string[]>(User.FindFirstValue("astronaut_ids") ?? "[]") ?? [];
-        var assigned = users.Users.Where(u => ids.Contains(u.Id));
+
         var candidates = new List<ApplicationUser>();
-        foreach (var user in await assigned.ToListAsync())
+        foreach (var user in await users.Users.ToListAsync())
         {
             var roles = await users.GetRolesAsync(user);
             if (!roles.Contains(AppRoles.Crew) && !roles.Contains(AppRoles.Medic)) continue;
             if (!active || !user.LockoutEnd.HasValue || user.LockoutEnd <= DateTimeOffset.UtcNow) candidates.Add(user);
         }
+
         if (!string.IsNullOrWhiteSpace(query))
             candidates = candidates.Where(u => (u.UserName ?? "").Contains(query, StringComparison.OrdinalIgnoreCase)).ToList();
+
         candidates = candidates.OrderBy(u => u.Id, StringComparer.Ordinal).ToList();
+
         if (cursor is not null)
         {
             try
@@ -58,6 +59,7 @@ public sealed class AuthSessionsController(
             catch (FormatException) { return BadRequest(); }
             candidates = candidates.Where(u => string.CompareOrdinal(u.Id, cursor) > 0).ToList();
         }
+
         var page = candidates.Take(limit + 1).ToArray();
         var items = page.Take(limit).Select(ToAstronaut).ToArray();
         var next = page.Length > limit ? Convert.ToBase64String(Encoding.UTF8.GetBytes(page[limit - 1].Id)) : null;
@@ -66,26 +68,24 @@ public sealed class AuthSessionsController(
 
     [HttpPost("auth/sessions")]
     [EnableRateLimiting("login")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Device)]
+    [AllowAnonymous]
     public async Task<IActionResult> Login(LoginRequest body)
     {
-        var unoId = User.FindFirstValue("device_id")!;
-        if (User.FindFirstValue("device_kind") != "uno") return Forbid();
-        var uno = await db.Devices.FindAsync(unoId);
-        var ids = JsonSerializer.Deserialize<string[]>(uno?.AstronautIdsJson ?? "[]") ?? [];
         var user = await users.FindByIdAsync(body.AstronautId);
-        var assigned = user is not null && ids.Contains(user.Id);
-        var hasRole = user is not null && (await users.GetRolesAsync(user)).Any(r => r is AppRoles.Crew or AppRoles.Medic);
-        if (!assigned || !hasRole)
+        var hasRole = user is not null &&
+                      (await users.GetRolesAsync(user)).Any(r => r is AppRoles.Crew or AppRoles.Medic);
+
+        if (user is null || !hasRole)
         {
-            // Verify against a dummy hash to keep unknown-account timing closer to a real password check.
             await Task.Delay(Random.Shared.Next(80, 140), HttpContext.RequestAborted);
             return Unauthorized();
         }
-        var result = await signIn.CheckPasswordSignInAsync(user!, body.Pin, lockoutOnFailure: true);
+
+        var result = await signIn.CheckPasswordSignInAsync(user, body.Pin, lockoutOnFailure: true);
         if (result.IsLockedOut) return StatusCode(423);
         if (!result.Succeeded) return Unauthorized();
-        var (session, response) = NewSession(user!, unoId);
+
+        var (session, response) = NewSession(user, "dev-anonymous");
         db.Sessions.Add(session);
         await db.SaveChangesAsync(HttpContext.RequestAborted);
         return StatusCode(StatusCodes.Status201Created, response);
@@ -102,34 +102,39 @@ public sealed class AuthSessionsController(
             return Unauthorized();
         var user = await users.FindByIdAsync(session.AstronautId);
         if (user is null) return Unauthorized();
-        if (!await db.Devices.AnyAsync(x => x.DeviceId == session.UnoDeviceId && x.Kind == "uno" && x.Active))
-            return Unauthorized();
+        // Device check removed: sessions created by the anonymous login use the placeholder "dev-anonymous" device.
         var (_, response) = NewSession(user, session.UnoDeviceId, session);
         await db.SaveChangesAsync(HttpContext.RequestAborted);
         return Ok(response);
     }
 
     [HttpGet("auth/sessions/current")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
+    [AllowAnonymous]
     public async Task<IActionResult> Current()
     {
         var session = await CurrentSession();
+        if (session is null) return NotFound();
         var user = await users.FindByIdAsync(session.AstronautId);
-        return user is null ? Unauthorized() : Ok(new CurrentSessionResponse(session.Id, ToAstronaut(user), session.AccessExpiresAt));
+        return user is null ? NotFound() : Ok(new CurrentSessionResponse(session.Id, ToAstronaut(user), session.AccessExpiresAt));
     }
 
     [HttpDelete("auth/sessions/current")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
+    [AllowAnonymous]
     public async Task<IActionResult> Logout()
     {
         var session = await CurrentSession();
+        if (session is null) return NotFound();
         session.RevokedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(HttpContext.RequestAborted);
         return NoContent();
     }
 
-    private async Task<ApiSession> CurrentSession() => await db.Sessions.SingleAsync(s => s.Id == User.FindFirstValue("sid"));
-
+// No bearer token means no "sid" claim, so the session ID comes from a header instead.
+    private async Task<ApiSession?> CurrentSession()
+    {
+        var id = Request.Headers["X-Session-Id"].FirstOrDefault();
+        return string.IsNullOrEmpty(id) ? null : await db.Sessions.SingleOrDefaultAsync(s => s.Id == id);
+    }
     private (ApiSession Session, SessionResponse Response) NewSession(ApplicationUser user, string unoId, ApiSession? existing = null)
     {
         var now = DateTimeOffset.UtcNow;

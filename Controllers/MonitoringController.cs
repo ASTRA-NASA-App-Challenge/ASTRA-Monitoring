@@ -1,31 +1,31 @@
 using System.Globalization;
-using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using MonitoringApi.Auth;
 using MonitoringApi.Data;
 using MonitoringApi.Models;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.PixelFormats;
-using MonitoringApi.Identity;
 
 namespace MonitoringApi.Controllers;
 
 [ApiController]
+[AllowAnonymous]
 [Route("api/v1")]
-public sealed class MonitoringController(ApiDbContext db, IAuthorizationService authorization, IWebHostEnvironment environment) : ControllerBase
+public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment environment) : ControllerBase
 {
     private const long MaxPhotoBytes = 5 * 1024 * 1024;
     private static readonly string[] Dimensions = ["160x120", "320x240"];
 
+    // --- No-auth replacements for claims ---
+    private string AstronautId => Request.Headers["X-Astronaut-Id"].FirstOrDefault() is { Length: > 0 } h ? h : "dev-astronaut";
+    private string SessionId   => Request.Headers["X-Session-Id"].FirstOrDefault()   is { Length: > 0 } h ? h : "dev-session";
+
     [HttpPost("measurements")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
     public async Task<IActionResult> CreateMeasurement([FromBody] CreateMeasurementRequest body)
     {
         if (!TryIdempotency(out var key)) return BadRequest();
@@ -37,18 +37,14 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
             || body.Photo.MediaType is not ("image/jpeg" or "application/vnd.demo.rgb565"))
             return UnprocessableEntity();
 
-        var unoId = User.FindFirstValue("uno_device_id")!;
-        var uno = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == unoId && x.Active && x.Kind == "uno");
-        if (uno is null || uno.PairedDeviceId != body.Photo.CameraId) return StatusCode(403);
-        var camera = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == body.Photo.CameraId && x.Active && x.Kind == "camera");
-        if (camera is null || camera.PairedDeviceId != unoId) return StatusCode(403);
+        var camera = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == body.Photo.CameraId && x.Kind == "camera");
+        if (camera is null) return NotFound("Unknown camera device");
+        var unoId = camera.PairedDeviceId;
 
         var existing = await db.Measurements.SingleOrDefaultAsync(x => x.UnoDeviceId == unoId && x.IdempotencyKey == key);
         if (existing is not null)
         {
-            if (existing.AstronautId != User.FindFirstValue(ClaimTypes.NameIdentifier)
-                || existing.SessionId != User.FindFirstValue("sid") || existing.ClientMeasurementId != body.ClientMeasurementId
-                || !MeasurementMatches(existing, body)) return Conflict();
+            if (existing.ClientMeasurementId != body.ClientMeasurementId || !MeasurementMatches(existing, body)) return Conflict();
             if (existing.PhotoStatus == "awaiting_upload" && existing.PhotoExpiresAt <= DateTimeOffset.UtcNow)
             {
                 existing.PhotoStatus = "expired";
@@ -56,11 +52,12 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
             }
             return StatusCode(201, CreatedMeasurement(existing));
         }
+
         var now = DateTimeOffset.UtcNow;
         var item = new Measurement
         {
             Id = $"mea_{Guid.NewGuid():N}", ClientMeasurementId = body.ClientMeasurementId, IdempotencyKey = key,
-            AstronautId = User.FindFirstValue(ClaimTypes.NameIdentifier)!, SessionId = User.FindFirstValue("sid")!,
+            AstronautId = AstronautId, SessionId = SessionId,
             UnoDeviceId = unoId, CameraDeviceId = camera.DeviceId, MeasuredAt = body.MeasuredAt, CreatedAt = now,
             Bpm = body.Pulse.Bpm, Quality = body.Pulse.Quality, AlgorithmVersion = body.Pulse.AlgorithmVersion,
             PulseStatusReason = body.Pulse.StatusReason,
@@ -74,12 +71,10 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
     }
 
     [HttpGet("measurements/{measurementId}")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
     public async Task<IActionResult> GetMeasurement(string measurementId)
     {
         var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId);
         if (item is null) return NotFound();
-        if (!await CanRead(item.AstronautId)) return Forbid();
         if (item.PhotoStatus == "awaiting_upload" && item.PhotoExpiresAt <= DateTimeOffset.UtcNow)
         {
             var expired = await db.Measurements.SingleAsync(x => x.Id == measurementId);
@@ -91,17 +86,12 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
     }
 
     [HttpPut("measurements/{measurementId}/photo")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Device)]
     [RequestSizeLimit(MaxPhotoBytes)]
     public async Task<IActionResult> UploadPhoto(string measurementId)
     {
-        var cameraId = User.FindFirstValue("device_id");
-        if (User.FindFirstValue("device_kind") != "camera") return Forbid();
         if (!TryIdempotency(out var key)) return BadRequest();
         var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
         if (item is null) return NotFound();
-        if (item.CameraDeviceId != cameraId
-            || User.FindFirstValue("paired_device_id") != item.UnoDeviceId) return StatusCode(403);
         if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
             return StatusCode(415);
         if (item.PhotoStatus == "uploaded")
@@ -160,11 +150,9 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
     }
 
     [HttpGet("astronauts/{astronautId}/measurements")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
     public async Task<IActionResult> History(string astronautId, [FromQuery] DateTimeOffset? from = null,
         [FromQuery] DateTimeOffset? to = null, [FromQuery] int limit = 50, [FromQuery] string? cursor = null)
     {
-        if (!await CanRead(astronautId)) return Forbid();
         limit = Math.Clamp(limit, 1, 100);
         var end = to ?? DateTimeOffset.UtcNow;
         var start = from ?? end.AddDays(-31);
@@ -187,28 +175,24 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
     }
 
     [HttpGet("measurements/{measurementId}/photo")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
     public async Task<IActionResult> GetPhoto(string measurementId)
     {
         var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId);
         if (item is null) return NotFound();
-        if (!await CanRead(item.AstronautId)) return Forbid();
         if (item.PhotoStatus != "uploaded" || item.PhotoPath is null || !System.IO.File.Exists(item.PhotoPath)) return NotFound();
         Response.Headers["Cache-Control"] = "private, no-store";
         return PhysicalFile(item.PhotoPath, "image/jpeg", enableRangeProcessing: false);
     }
 
     [HttpPost("environment-readings")]
-    [Authorize(AuthenticationSchemes = ApiSchemes.Bearer)]
     public async Task<IActionResult> Environment([FromBody] EnvironmentRequest body)
     {
         if (!TryIdempotency(out var key)) return BadRequest();
-        var unoId = User.FindFirstValue("uno_device_id")!;
-        if (body.DeviceId != unoId) return StatusCode(403);
+        var unoId = body.DeviceId;
         if (!Guid.TryParse(body.ClientReadingId, out _) || body.Sensor != "DHT11" || body.MeasuredAt.Offset != TimeSpan.Zero || !double.IsFinite(body.TemperatureC)
             || !double.IsFinite(body.RelativeHumidityPercent) || body.TemperatureC is < 0 or > 50
             || body.RelativeHumidityPercent is < 0 or > 100) return UnprocessableEntity();
-        var sessionId = User.FindFirstValue("sid")!;
+        var sessionId = SessionId;
         var existing = await db.EnvironmentReadings.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.IdempotencyKey == key);
         if (existing is not null)
         {
@@ -218,7 +202,7 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
         var reading = new EnvironmentReading
         {
             Id = $"env_{Guid.NewGuid():N}", ClientReadingId = body.ClientReadingId, IdempotencyKey = key,
-            SessionId = sessionId, AstronautId = User.FindFirstValue(ClaimTypes.NameIdentifier)!, DeviceId = unoId,
+            SessionId = sessionId, AstronautId = AstronautId, DeviceId = unoId,
             MeasuredAt = body.MeasuredAt, ReceivedAt = DateTimeOffset.UtcNow, TemperatureC = body.TemperatureC,
             RelativeHumidityPercent = body.RelativeHumidityPercent
         };
@@ -227,11 +211,6 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
         return StatusCode(201, EnvironmentResponseFor(reading));
     }
 
-    private async Task<bool> CanRead(string astronautId)
-    {
-        var result = await authorization.AuthorizeAsync(User, astronautId, MedicalPolicies.ReadRecord);
-        return result.Succeeded;
-    }
     private bool TryIdempotency(out string key)
     {
         key = Request.Headers["Idempotency-Key"].ToString();
@@ -286,7 +265,7 @@ public sealed class MonitoringController(ApiDbContext db, IAuthorizationService 
         var pixels = new Rgb24[width * height];
         for (var i = 0; i < pixels.Length; i++)
         {
-            var value = (bytes[i * 2] << 8) | bytes[i * 2 + 1]; // Provisioned byte order: big endian.
+            var value = (bytes[i * 2] << 8) | bytes[i * 2 + 1];
             var red = (value >> 11) & 0x1f;
             var green = (value >> 5) & 0x3f;
             var blue = value & 0x1f;

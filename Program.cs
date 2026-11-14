@@ -21,12 +21,17 @@ builder.Services.AddIdentityCore<ApplicationUser>(options =>
     {
         options.Lockout.MaxFailedAccessAttempts = 5;
         options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+        options.Password.RequiredLength = 6;
+        options.Password.RequireUppercase = false;
+        options.Password.RequireLowercase = false;
+        options.Password.RequireNonAlphanumeric = false;
     })
     .AddRoles<IdentityRole>()
     .AddSignInManager()
     .AddEntityFrameworkStores<ApplicationDbContext>();
 builder.Services.AddScoped<IPasswordHasher<DeviceRegistration>, PasswordHasher<DeviceRegistration>>();
 builder.Services.AddScoped<ApiDeviceProvisioner>();
+builder.Services.AddScoped<DemoDataSeeder>();
 builder.Services.AddAuthorization(options => options.AddPolicy(MedicalPolicies.ReadRecord,
     policy => policy.RequireAuthenticatedUser().AddRequirements(new ReadMedicalRecordRequirement())));
 builder.Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationHandler, MedicalRecordAuthorizationHandler>();
@@ -51,7 +56,6 @@ builder.Services.AddControllers().AddJsonOptions(options =>
     options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 builder.Services.Configure<ApiBehaviorOptions>(options => options.InvalidModelStateResponseFactory = ApiValidationResponseFactory.Create);
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 5 * 1024 * 1024);
-
 var app = builder.Build();
 await using (var scope = app.Services.CreateAsyncScope())
 {
@@ -69,9 +73,18 @@ await using (var scope = app.Services.CreateAsyncScope())
     var apiDb = services.GetRequiredService<ApiDbContext>();
     await apiDb.Database.EnsureCreatedAsync();
     await services.GetRequiredService<ApiDeviceProvisioner>().ProvisionAsync(CancellationToken.None);
+
+    if (args.Contains("--seed-demo", StringComparer.OrdinalIgnoreCase))
+    {
+        if (!app.Environment.IsDevelopment())
+            throw new InvalidOperationException("Demo data can only be seeded in the Development environment.");
+        var credentialFile = await services.GetRequiredService<DemoDataSeeder>().SeedAsync(builder.Environment.ContentRootPath);
+        Console.WriteLine($"Synthetic demo data created. Local credentials were written to {credentialFile}.");
+        return;
+    }
 }
 app.UseMiddleware<ApiErrorMiddleware>();
-app.UseHttpsRedirection();
+//app.UseHttpsRedirection();
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();

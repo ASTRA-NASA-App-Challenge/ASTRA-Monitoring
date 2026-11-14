@@ -99,8 +99,9 @@ public sealed class ApiDeviceProvisioner(
     {
         var configuredDevices = configuration.GetSection("MonitoringApi:Devices").GetChildren().ToArray();
         var configuredIds = configuredDevices.Select(x => x["DeviceId"]?.Trim()).Where(x => !string.IsNullOrWhiteSpace(x)).ToHashSet();
-        foreach (var inactive in await db.Devices.Where(x => x.Active).ToListAsync(cancellationToken))
-            if (!configuredIds.Contains(inactive.DeviceId)) inactive.Active = false;
+        if (configuredDevices.Length > 0)
+            foreach (var inactive in await db.Devices.Where(x => x.Active).ToListAsync(cancellationToken))
+                if (!configuredIds.Contains(inactive.DeviceId)) inactive.Active = false;
 
         foreach (var item in configuredDevices)
         {
