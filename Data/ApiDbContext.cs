@@ -22,7 +22,6 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
         modelBuilder.Entity<ApiSession>().Property(x => x.RevokedAt).HasConversion(x => x.HasValue ? x.Value.UtcTicks : (long?)null,
             x => x.HasValue ? new DateTimeOffset(x.Value, TimeSpan.Zero) : null);
         modelBuilder.Entity<Measurement>().HasKey(x => x.Id);
-        modelBuilder.Entity<Measurement>().HasIndex(x => new { x.UnoDeviceId, x.IdempotencyKey }).IsUnique();
         modelBuilder.Entity<Measurement>().HasIndex(x => new { x.AstronautId, x.MeasuredAt });
         modelBuilder.Entity<Measurement>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<Measurement>().Property(x => x.CreatedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
@@ -30,7 +29,6 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
         modelBuilder.Entity<Measurement>().Property(x => x.PhotoReceivedAt).HasConversion(x => x.HasValue ? x.Value.UtcTicks : (long?)null,
             x => x.HasValue ? new DateTimeOffset(x.Value, TimeSpan.Zero) : null);
         modelBuilder.Entity<EnvironmentReading>().HasKey(x => x.Id);
-        modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { x.SessionId, x.IdempotencyKey }).IsUnique();
         modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { x.AstronautId, x.MeasuredAt });
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.ReceivedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
@@ -64,7 +62,6 @@ public sealed class Measurement
 {
     public required string Id { get; set; }
     public required string ClientMeasurementId { get; set; }
-    public required string IdempotencyKey { get; set; }
     public required string AstronautId { get; set; }
     public required string SessionId { get; set; }
     public required string UnoDeviceId { get; set; }
@@ -72,6 +69,8 @@ public sealed class Measurement
     public DateTimeOffset MeasuredAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public int Bpm { get; set; }
+    
+    public string IdempotencyKey { get; set; } = Guid.NewGuid().ToString();
     public required string Quality { get; set; }
     public required string AlgorithmVersion { get; set; }
     public string? PulseStatusReason { get; set; }
@@ -83,7 +82,6 @@ public sealed class Measurement
     public DateTimeOffset PhotoExpiresAt { get; set; }
     public string? PhotoPath { get; set; }
     public string? PhotoSha256 { get; set; }
-    public string? PhotoIdempotencyKey { get; set; }
     public DateTimeOffset? PhotoReceivedAt { get; set; }
 }
 
@@ -91,12 +89,13 @@ public sealed class EnvironmentReading
 {
     public required string Id { get; set; }
     public required string ClientReadingId { get; set; }
-    public required string IdempotencyKey { get; set; }
     public required string SessionId { get; set; }
     public required string AstronautId { get; set; }
     public required string DeviceId { get; set; }
     public DateTimeOffset MeasuredAt { get; set; }
     public DateTimeOffset ReceivedAt { get; set; }
     public double TemperatureC { get; set; }
+    
+    public string IdempotencyKey { get; set; } = Guid.NewGuid().ToString();
     public double RelativeHumidityPercent { get; set; }
 }

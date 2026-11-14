@@ -28,7 +28,6 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
     [HttpPost("measurements")]
     public async Task<IActionResult> CreateMeasurement([FromBody] CreateMeasurementRequest body)
     {
-        if (!TryIdempotency(out var key)) return BadRequest();
         if (!Guid.TryParse(body.ClientMeasurementId, out _) || body.MeasuredAt.Offset != TimeSpan.Zero
             || body.Pulse.Bpm is < 0 or > 250 || body.Pulse.Quality is not ("good" or "fair" or "poor" or "unknown")
             || string.IsNullOrWhiteSpace(body.Pulse.AlgorithmVersion) || body.Pulse.Bpm == 0 && string.IsNullOrWhiteSpace(body.Pulse.StatusReason)
@@ -41,22 +40,10 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         if (camera is null) return NotFound("Unknown camera device");
         var unoId = camera.PairedDeviceId;
 
-        var existing = await db.Measurements.SingleOrDefaultAsync(x => x.UnoDeviceId == unoId && x.IdempotencyKey == key);
-        if (existing is not null)
-        {
-            if (existing.ClientMeasurementId != body.ClientMeasurementId || !MeasurementMatches(existing, body)) return Conflict();
-            if (existing.PhotoStatus == "awaiting_upload" && existing.PhotoExpiresAt <= DateTimeOffset.UtcNow)
-            {
-                existing.PhotoStatus = "expired";
-                await db.SaveChangesAsync(HttpContext.RequestAborted);
-            }
-            return StatusCode(201, CreatedMeasurement(existing));
-        }
-
         var now = DateTimeOffset.UtcNow;
         var item = new Measurement
         {
-            Id = $"mea_{Guid.NewGuid():N}", ClientMeasurementId = body.ClientMeasurementId, IdempotencyKey = key,
+            Id = $"mea_{Guid.NewGuid():N}", ClientMeasurementId = body.ClientMeasurementId,
             AstronautId = AstronautId, SessionId = SessionId,
             UnoDeviceId = unoId, CameraDeviceId = camera.DeviceId, MeasuredAt = body.MeasuredAt, CreatedAt = now,
             Bpm = body.Pulse.Bpm, Quality = body.Pulse.Quality, AlgorithmVersion = body.Pulse.AlgorithmVersion,
@@ -86,68 +73,66 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
     }
 
     [HttpPut("measurements/{measurementId}/photo")]
-    [RequestSizeLimit(MaxPhotoBytes)]
-    public async Task<IActionResult> UploadPhoto(string measurementId)
+[RequestSizeLimit(MaxPhotoBytes)]
+public async Task<IActionResult> UploadPhoto(string measurementId)
+{
+    var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
+    if (item is null) return NotFound();
+    if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
+        return StatusCode(415);
+    if (item.PhotoStatus == "uploaded")
     {
-        if (!TryIdempotency(out var key)) return BadRequest();
-        var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
-        if (item is null) return NotFound();
-        if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
-            return StatusCode(415);
-        if (item.PhotoStatus == "uploaded")
+        var digest = await HashRequestBody();
+        return item.PhotoSha256 == digest
+            ? Ok(new PhotoResponse(item.Id, "uploaded", item.PhotoReceivedAt ?? DateTimeOffset.UtcNow))
+            : Conflict();
+    }
+    if (item.PhotoStatus != "awaiting_upload" || item.PhotoExpiresAt <= DateTimeOffset.UtcNow) return StatusCode(410);
+    var tempPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.tmp");
+    var normalizedPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.jpg");
+    try
+    {
+        var (length, digest) = await SaveBoundedAsync(Request.Body, tempPath, MaxPhotoBytes, HttpContext.RequestAborted);
+        if (item.MediaType == "application/vnd.demo.rgb565" && length != item.Width * item.Height * 2L)
+            return UnprocessableEntity();
+        if (item.MediaType == "image/jpeg")
         {
-            var digest = await HashRequestBody();
-            return item.PhotoSha256 == digest
-                ? Ok(new PhotoResponse(item.Id, "uploaded", item.PhotoReceivedAt ?? DateTimeOffset.UtcNow))
-                : Conflict();
-        }
-        if (item.PhotoStatus != "awaiting_upload" || item.PhotoExpiresAt <= DateTimeOffset.UtcNow) return StatusCode(410);
-        var tempPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.tmp");
-        var normalizedPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.jpg");
-        try
-        {
-            var (length, digest) = await SaveBoundedAsync(Request.Body, tempPath, MaxPhotoBytes, HttpContext.RequestAborted);
-            if (item.MediaType == "application/vnd.demo.rgb565" && length != item.Width * item.Height * 2L)
-                return UnprocessableEntity();
-            if (item.MediaType == "image/jpeg")
+            try
             {
-                try
-                {
-                    var info = await Image.IdentifyAsync(tempPath, HttpContext.RequestAborted);
-                    if (info is null || info.Width != item.Width || info.Height != item.Height) return UnprocessableEntity();
-                    using var image = await Image.LoadAsync<Rgb24>(tempPath, HttpContext.RequestAborted);
-                    await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
-                }
-                catch (Exception ex) when (ex.GetType().Namespace?.StartsWith("SixLabors.ImageSharp", StringComparison.Ordinal) == true)
-                {
-                    return UnprocessableEntity();
-                }
-            }
-            else
-            {
-                var pixels = await DecodeRgb565Async(tempPath, item.Width, item.Height, HttpContext.RequestAborted);
-                using var image = Image.LoadPixelData(pixels, item.Width, item.Height);
+                var info = await Image.IdentifyAsync(tempPath, HttpContext.RequestAborted);
+                if (info is null || info.Width != item.Width || info.Height != item.Height) return UnprocessableEntity();
+                using var image = await Image.LoadAsync<Rgb24>(tempPath, HttpContext.RequestAborted);
                 await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
             }
-            Directory.CreateDirectory(PhotoDirectory());
-            var finalPath = Path.Combine(PhotoDirectory(), $"{Guid.NewGuid():N}.jpg");
-            System.IO.File.Move(normalizedPath, finalPath);
-            item.PhotoPath = finalPath;
-            item.PhotoSha256 = digest;
-            item.PhotoIdempotencyKey = key;
-            item.PhotoStatus = "uploaded";
-            item.PhotoReceivedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(HttpContext.RequestAborted);
-            return Ok(new PhotoResponse(item.Id, item.PhotoStatus, item.PhotoReceivedAt.Value));
+            catch (Exception ex) when (ex.GetType().Namespace?.StartsWith("SixLabors.ImageSharp", StringComparison.Ordinal) == true)
+            {
+                return UnprocessableEntity();
+            }
         }
-        catch (PayloadTooLargeException) { return StatusCode(413); }
-        catch (Microsoft.AspNetCore.Server.Kestrel.Core.BadHttpRequestException) { return StatusCode(413); }
-        finally
+        else
         {
-            if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath);
-            if (System.IO.File.Exists(normalizedPath)) System.IO.File.Delete(normalizedPath);
+            var pixels = await DecodeRgb565Async(tempPath, item.Width, item.Height, HttpContext.RequestAborted);
+            using var image = Image.LoadPixelData(pixels, item.Width, item.Height);
+            await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
         }
+        Directory.CreateDirectory(PhotoDirectory());
+        var finalPath = Path.Combine(PhotoDirectory(), $"{Guid.NewGuid():N}.jpg");
+        System.IO.File.Move(normalizedPath, finalPath);
+        item.PhotoPath = finalPath;
+        item.PhotoSha256 = digest;
+        item.PhotoStatus = "uploaded";
+        item.PhotoReceivedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(HttpContext.RequestAborted);
+        return Ok(new PhotoResponse(item.Id, item.PhotoStatus, item.PhotoReceivedAt.Value));
     }
+    catch (PayloadTooLargeException) { return StatusCode(413); }
+    catch (Microsoft.AspNetCore.Server.Kestrel.Core.BadHttpRequestException) { return StatusCode(413); }
+    finally
+    {
+        if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath);
+        if (System.IO.File.Exists(normalizedPath)) System.IO.File.Delete(normalizedPath);
+    }
+}
 
     [HttpGet("astronauts/{astronautId}/measurements")]
     public async Task<IActionResult> History(string astronautId, [FromQuery] DateTimeOffset? from = null,
@@ -187,21 +172,14 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
     [HttpPost("environment-readings")]
     public async Task<IActionResult> Environment([FromBody] EnvironmentRequest body)
     {
-        if (!TryIdempotency(out var key)) return BadRequest();
         var unoId = body.DeviceId;
         if (!Guid.TryParse(body.ClientReadingId, out _) || body.Sensor != "DHT11" || body.MeasuredAt.Offset != TimeSpan.Zero || !double.IsFinite(body.TemperatureC)
             || !double.IsFinite(body.RelativeHumidityPercent) || body.TemperatureC is < 0 or > 50
             || body.RelativeHumidityPercent is < 0 or > 100) return UnprocessableEntity();
         var sessionId = SessionId;
-        var existing = await db.EnvironmentReadings.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.IdempotencyKey == key);
-        if (existing is not null)
-        {
-            if (!ReadingMatches(existing, body)) return Conflict();
-            return StatusCode(201, EnvironmentResponseFor(existing));
-        }
         var reading = new EnvironmentReading
         {
-            Id = $"env_{Guid.NewGuid():N}", ClientReadingId = body.ClientReadingId, IdempotencyKey = key,
+            Id = $"env_{Guid.NewGuid():N}", ClientReadingId = body.ClientReadingId,
             SessionId = sessionId, AstronautId = AstronautId, DeviceId = unoId,
             MeasuredAt = body.MeasuredAt, ReceivedAt = DateTimeOffset.UtcNow, TemperatureC = body.TemperatureC,
             RelativeHumidityPercent = body.RelativeHumidityPercent
@@ -211,11 +189,6 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         return StatusCode(201, EnvironmentResponseFor(reading));
     }
 
-    private bool TryIdempotency(out string key)
-    {
-        key = Request.Headers["Idempotency-Key"].ToString();
-        return Guid.TryParse(key, out _);
-    }
     private CreateMeasurementResponse CreatedMeasurement(Measurement x) => new(x.Id, x.ClientMeasurementId, x.AstronautId,
         x.CreatedAt, x.PhotoStatus, x.PhotoExpiresAt);
     private static MeasurementDto ToMeasurement(Measurement x) => new(x.Id, x.MeasuredAt, new PulseSummary(x.Bpm, x.Quality, x.PulseStatusReason),

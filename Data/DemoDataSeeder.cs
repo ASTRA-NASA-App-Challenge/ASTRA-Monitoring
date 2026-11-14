@@ -111,7 +111,6 @@ public sealed class DemoDataSeeder(
                 {
                     Id = $"mea_seed_{Guid.NewGuid():N}",
                     ClientMeasurementId = Guid.NewGuid().ToString(),
-                    IdempotencyKey = Guid.NewGuid().ToString(),
                     AstronautId = astronaut.Id,
                     SessionId = sessionId,
                     UnoDeviceId = uno.DeviceId,
@@ -136,7 +135,6 @@ public sealed class DemoDataSeeder(
                 {
                     Id = $"env_seed_{Guid.NewGuid():N}",
                     ClientReadingId = Guid.NewGuid().ToString(),
-                    IdempotencyKey = Guid.NewGuid().ToString(),
                     SessionId = sessionId,
                     AstronautId = astronaut.Id,
                     DeviceId = uno.DeviceId,
