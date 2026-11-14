@@ -394,6 +394,10 @@ MSBuild_Logs/
 # BeatPulse healthcheck temp database
 healthchecksdb
 
+# Local monitoring databases and captured photos
+*.db
+App_Data/photos/
+
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/
 
