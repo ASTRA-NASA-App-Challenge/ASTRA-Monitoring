@@ -5,17 +5,20 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Data.Sqlite;
 using MonitoringApi;
 using MonitoringApi.Auth;
 using MonitoringApi.Data;
 using MonitoringApi.Identity;
+using MonitoringApi.Services;
+using Npgsql.EntityFrameworkCore.PostgreSQL;
 
 var builder = WebApplication.CreateBuilder(args);
-var identityConnection = ResolveConnection(builder, "DefaultConnection", "Data Source=astra.db");
-var monitoringConnection = ResolveConnection(builder, "MonitoringApi:ConnectionString", "Data Source=monitoring.db");
-builder.Services.AddDbContext<ApplicationDbContext>(options => options.UseSqlite(identityConnection));
-builder.Services.AddDbContext<ApiDbContext>(options => options.UseSqlite(monitoringConnection));
+var identityConnection = ResolveConnection(builder, "DefaultConnection", "Host=localhost;Port=5432;Database=astra;Username=postgres;Password=postgres");
+var monitoringConnection = ResolveConnection(builder, "MonitoringApi:ConnectionString", "Host=localhost;Port=5432;Database=astra_monitoring;Username=postgres;Password=postgres");
+builder.Services.AddDbContext<ApplicationDbContext>(options => options.UseNpgsql(identityConnection));
+builder.Services.AddDbContext<ApiDbContext>(options => options.UseNpgsql(monitoringConnection));
+
+builder.Services.AddHttpClient();
 
 builder.Services.AddIdentityCore<ApplicationUser>(options =>
     {
@@ -32,6 +35,7 @@ builder.Services.AddIdentityCore<ApplicationUser>(options =>
 builder.Services.AddScoped<IPasswordHasher<DeviceRegistration>, PasswordHasher<DeviceRegistration>>();
 builder.Services.AddScoped<ApiDeviceProvisioner>();
 builder.Services.AddScoped<DemoDataSeeder>();
+builder.Services.AddScoped<SupabasePhotoStorage>();
 builder.Services.AddAuthorization(options => options.AddPolicy(MedicalPolicies.ReadRecord,
     policy => policy.RequireAuthenticatedUser().AddRequirements(new ReadMedicalRecordRequirement())));
 builder.Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationHandler, MedicalRecordAuthorizationHandler>();
@@ -93,12 +97,9 @@ app.Run();
 
 static string ResolveConnection(WebApplicationBuilder builder, string key, string fallback)
 {
-    var value = key.Contains(':') ? builder.Configuration[key] : builder.Configuration.GetConnectionString(key);
-    var connection = new SqliteConnectionStringBuilder(value ?? fallback);
-    if (connection.DataSource != ":memory:" && !Path.IsPathRooted(connection.DataSource))
-        connection.DataSource = Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, connection.DataSource));
-    Directory.CreateDirectory(Path.GetDirectoryName(connection.DataSource) ?? builder.Environment.ContentRootPath);
-    return connection.ToString();
+    var value = builder.Configuration.GetConnectionString(key) ?? builder.Configuration[key] ?? Environment.GetEnvironmentVariable(key) ?? fallback;
+    if (string.IsNullOrWhiteSpace(value)) return fallback;
+    return value.Trim();
 }
 
 static async Task EnsureIdentityDatabaseAsync(ApplicationDbContext db)
@@ -107,10 +108,10 @@ static async Task EnsureIdentityDatabaseAsync(ApplicationDbContext db)
     try
     {
         using var command = db.Database.GetDbConnection().CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('AspNetUsers', 'AspNetRoles')";
+        command.CommandText = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('AspNetUsers', 'AspNetRoles')";
         var tableCount = Convert.ToInt32(await command.ExecuteScalarAsync());
         if (tableCount != 2)
-            throw new InvalidOperationException("The shared Identity database is not initialized. Start ASTRA-Web once and point ConnectionStrings:DefaultConnection to its SQLite database.");
+            throw new InvalidOperationException("The shared Identity database is not initialized. Start ASTRA-Web once and point DefaultConnection to the Supabase PostgreSQL database.");
     }
     finally
     {

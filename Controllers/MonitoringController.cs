@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using MonitoringApi.Data;
 using MonitoringApi.Models;
+using MonitoringApi.Services;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.PixelFormats;
@@ -16,7 +17,7 @@ namespace MonitoringApi.Controllers;
 [ApiController]
 [AllowAnonymous]
 [Route("api/v1")]
-public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment environment) : ControllerBase
+public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment environment, SupabasePhotoStorage photoStorage) : ControllerBase
 {
     private const long MaxPhotoBytes = 5 * 1024 * 1024;
     private static readonly string[] Dimensions = ["160x120", "320x240"];
@@ -73,66 +74,69 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
     }
 
     [HttpPut("measurements/{measurementId}/photo")]
-[RequestSizeLimit(MaxPhotoBytes)]
-public async Task<IActionResult> UploadPhoto(string measurementId)
-{
-    var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
-    if (item is null) return NotFound();
-    if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
-        return StatusCode(415);
-    if (item.PhotoStatus == "uploaded")
+    [RequestSizeLimit(MaxPhotoBytes)]
+    public async Task<IActionResult> UploadPhoto(string measurementId)
     {
-        var digest = await HashRequestBody();
-        return item.PhotoSha256 == digest
-            ? Ok(new PhotoResponse(item.Id, "uploaded", item.PhotoReceivedAt ?? DateTimeOffset.UtcNow))
-            : Conflict();
-    }
-    if (item.PhotoStatus != "awaiting_upload" || item.PhotoExpiresAt <= DateTimeOffset.UtcNow) return StatusCode(410);
-    var tempPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.tmp");
-    var normalizedPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.jpg");
-    try
-    {
-        var (length, digest) = await SaveBoundedAsync(Request.Body, tempPath, MaxPhotoBytes, HttpContext.RequestAborted);
-        if (item.MediaType == "application/vnd.demo.rgb565" && length != item.Width * item.Height * 2L)
-            return UnprocessableEntity();
-        if (item.MediaType == "image/jpeg")
+        var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
+        if (item is null) return NotFound();
+        if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
+            return StatusCode(415);
+        if (item.PhotoStatus == "uploaded")
         {
-            try
+            var digest = await HashRequestBody();
+            return item.PhotoSha256 == digest
+                ? Ok(new PhotoResponse(item.Id, "uploaded", item.PhotoReceivedAt ?? DateTimeOffset.UtcNow))
+                : Conflict();
+        }
+        if (item.PhotoStatus != "awaiting_upload" || item.PhotoExpiresAt <= DateTimeOffset.UtcNow) return StatusCode(410);
+
+        var tempPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.tmp");
+        var normalizedPath = Path.Combine(Path.GetTempPath(), $"astra-{Guid.NewGuid():N}.jpg");
+        try
+        {
+            var (length, digest) = await SaveBoundedAsync(Request.Body, tempPath, MaxPhotoBytes, HttpContext.RequestAborted);
+            if (item.MediaType == "application/vnd.demo.rgb565" && length != item.Width * item.Height * 2L)
+                return UnprocessableEntity();
+
+            if (item.MediaType == "image/jpeg")
             {
-                var info = await Image.IdentifyAsync(tempPath, HttpContext.RequestAborted);
-                if (info is null || info.Width != item.Width || info.Height != item.Height) return UnprocessableEntity();
-                using var image = await Image.LoadAsync<Rgb24>(tempPath, HttpContext.RequestAborted);
+                try
+                {
+                    var info = await Image.IdentifyAsync(tempPath, HttpContext.RequestAborted);
+                    if (info is null || info.Width != item.Width || info.Height != item.Height) return UnprocessableEntity();
+                    using var image = await Image.LoadAsync<Rgb24>(tempPath, HttpContext.RequestAborted);
+                    await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
+                }
+                catch (Exception ex) when (ex.GetType().Namespace?.StartsWith("SixLabors.ImageSharp", StringComparison.Ordinal) == true)
+                {
+                    return UnprocessableEntity();
+                }
+            }
+            else
+            {
+                var pixels = await DecodeRgb565Async(tempPath, item.Width, item.Height, HttpContext.RequestAborted);
+                using var image = Image.LoadPixelData(pixels, item.Width, item.Height);
                 await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
             }
-            catch (Exception ex) when (ex.GetType().Namespace?.StartsWith("SixLabors.ImageSharp", StringComparison.Ordinal) == true)
-            {
-                return UnprocessableEntity();
-            }
+
+            await using var uploadStream = System.IO.File.OpenRead(normalizedPath);
+            var publicUrl = await photoStorage.UploadAsync(uploadStream, $"{item.Id}.jpg", "image/jpeg", HttpContext.RequestAborted);
+
+            item.PhotoPath = publicUrl;
+            item.PhotoSha256 = digest;
+            item.PhotoStatus = "uploaded";
+            item.PhotoReceivedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(HttpContext.RequestAborted);
+            return Ok(new PhotoResponse(item.Id, item.PhotoStatus, item.PhotoReceivedAt.Value));
         }
-        else
+        catch (PayloadTooLargeException) { return StatusCode(413); }
+        catch (Microsoft.AspNetCore.Server.Kestrel.Core.BadHttpRequestException) { return StatusCode(413); }
+        finally
         {
-            var pixels = await DecodeRgb565Async(tempPath, item.Width, item.Height, HttpContext.RequestAborted);
-            using var image = Image.LoadPixelData(pixels, item.Width, item.Height);
-            await image.SaveAsJpegAsync(normalizedPath, new JpegEncoder { Quality = 85 }, HttpContext.RequestAborted);
+            if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath);
+            if (System.IO.File.Exists(normalizedPath)) System.IO.File.Delete(normalizedPath);
         }
-        Directory.CreateDirectory(PhotoDirectory());
-        var finalPath = Path.Combine(PhotoDirectory(), $"{Guid.NewGuid():N}.jpg");
-        System.IO.File.Move(normalizedPath, finalPath);
-        item.PhotoPath = finalPath;
-        item.PhotoSha256 = digest;
-        item.PhotoStatus = "uploaded";
-        item.PhotoReceivedAt = DateTimeOffset.UtcNow;
-        await db.SaveChangesAsync(HttpContext.RequestAborted);
-        return Ok(new PhotoResponse(item.Id, item.PhotoStatus, item.PhotoReceivedAt.Value));
     }
-    catch (PayloadTooLargeException) { return StatusCode(413); }
-    catch (Microsoft.AspNetCore.Server.Kestrel.Core.BadHttpRequestException) { return StatusCode(413); }
-    finally
-    {
-        if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath);
-        if (System.IO.File.Exists(normalizedPath)) System.IO.File.Delete(normalizedPath);
-    }
-}
 
     [HttpGet("astronauts/{astronautId}/measurements")]
     public async Task<IActionResult> History(string astronautId, [FromQuery] DateTimeOffset? from = null,
@@ -164,9 +168,9 @@ public async Task<IActionResult> UploadPhoto(string measurementId)
     {
         var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId);
         if (item is null) return NotFound();
-        if (item.PhotoStatus != "uploaded" || item.PhotoPath is null || !System.IO.File.Exists(item.PhotoPath)) return NotFound();
+        if (item.PhotoStatus != "uploaded" || item.PhotoPath is null || string.IsNullOrWhiteSpace(item.PhotoPath)) return NotFound();
         Response.Headers["Cache-Control"] = "private, no-store";
-        return PhysicalFile(item.PhotoPath, "image/jpeg", enableRangeProcessing: false);
+        return Redirect(item.PhotoPath);
     }
 
     [HttpPost("environment-readings")]
@@ -208,7 +212,6 @@ public async Task<IActionResult> UploadPhoto(string measurementId)
         && x.RelativeHumidityPercent == b.RelativeHumidityPercent;
     private static EnvironmentResponse EnvironmentResponseFor(EnvironmentReading x) =>
         new(x.Id, x.ClientReadingId, x.AstronautId, x.ReceivedAt, "accepted");
-    private string PhotoDirectory() => Path.Combine(environment.ContentRootPath, "App_Data", "photos");
     private async Task<string> HashRequestBody()
     {
         using var sha = SHA256.Create();
