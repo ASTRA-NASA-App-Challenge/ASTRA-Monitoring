@@ -6,6 +6,8 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
 {
     public DbSet<DeviceRegistration> Devices => Set<DeviceRegistration>();
     public DbSet<CrewMember> CrewMembers => Set<CrewMember>();
+    public DbSet<DeviceSession> DeviceSessions => Set<DeviceSession>();
+    public DbSet<PhotoUploadLease> PhotoUploadLeases => Set<PhotoUploadLease>();
     public DbSet<Measurement> Measurements => Set<Measurement>();
     public DbSet<EnvironmentReading> EnvironmentReadings => Set<EnvironmentReading>();
 
@@ -14,9 +16,16 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
         modelBuilder.Entity<DeviceRegistration>().HasKey(x => x.DeviceId);
         modelBuilder.Entity<DeviceRegistration>().Property(x => x.CredentialHash).IsRequired();
         modelBuilder.Entity<CrewMember>().HasKey(x => x.Pin);
+        modelBuilder.Entity<DeviceSession>().HasKey(x => x.Id);
+        modelBuilder.Entity<DeviceSession>().HasIndex(x => x.AccessHash).IsUnique();
+        modelBuilder.Entity<DeviceSession>().HasIndex(x => x.RefreshHash).IsUnique();
+        modelBuilder.Entity<DeviceSession>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<PhotoUploadLease>().HasKey(x => x.MeasurementId);
+        modelBuilder.Entity<PhotoUploadLease>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
         modelBuilder.Entity<Measurement>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
         modelBuilder.Entity<EnvironmentReading>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
         modelBuilder.Entity<Measurement>().HasKey(x => x.Id);
+        modelBuilder.Entity<Measurement>().HasIndex(x => new { x.Pin, x.ClientMeasurementId }).IsUnique();
         modelBuilder.Entity<Measurement>().HasIndex(x => new { AstronautId = x.Pin, x.MeasuredAt });
         modelBuilder.Entity<Measurement>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<Measurement>().Property(x => x.CreatedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
@@ -24,6 +33,7 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
         modelBuilder.Entity<Measurement>().Property(x => x.PhotoReceivedAt).HasConversion(x => x.HasValue ? x.Value.UtcTicks : (long?)null,
             x => x.HasValue ? new DateTimeOffset(x.Value, TimeSpan.Zero) : null);
         modelBuilder.Entity<EnvironmentReading>().HasKey(x => x.Id);
+        modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { x.Pin, x.ClientReadingId }).IsUnique();
         modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { AstronautId = x.Pin, x.MeasuredAt });
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.ReceivedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
@@ -40,7 +50,13 @@ public sealed class DeviceRegistration
     public bool Active { get; set; } = true;
 }
 
-public sealed class CrewMember { public required string Pin { get; set; } public static bool IsValid(string? pin) => pin is { Length: 6 } && pin.All(c => c is >= '0' and <= '9'); }
+public sealed class CrewMember
+{
+    public required string Pin { get; set; }
+    public bool Retired { get; set; }
+    public bool DeletionPending { get; set; }
+    public static bool IsValid(string? pin) => pin is { Length: 6 } && pin.All(c => c is >= '0' and <= '9');
+}
 
 public sealed class Measurement
 {
@@ -53,7 +69,7 @@ public sealed class Measurement
     public DateTimeOffset MeasuredAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public int Bpm { get; set; }
-    
+
     public string IdempotencyKey { get; set; } = Guid.NewGuid().ToString();
     public required string Quality { get; set; }
     public required string AlgorithmVersion { get; set; }
@@ -79,8 +95,7 @@ public sealed class EnvironmentReading
     public DateTimeOffset MeasuredAt { get; set; }
     public DateTimeOffset ReceivedAt { get; set; }
     public double TemperatureC { get; set; }
-    
+
     public string IdempotencyKey { get; set; } = Guid.NewGuid().ToString();
     public double RelativeHumidityPercent { get; set; }
 }
-

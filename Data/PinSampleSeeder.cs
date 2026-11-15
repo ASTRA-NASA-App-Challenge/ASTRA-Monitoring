@@ -8,6 +8,8 @@ public static class PinSampleSeeder
     {
         if (!CrewMember.IsValid(pin)) throw new ArgumentException("Seed PIN must contain exactly six digits.");
         await using var transaction = await db.Database.BeginTransactionAsync();
+        if (await db.CrewMembers.AnyAsync(x => x.Pin == pin && x.Retired))
+            throw new InvalidOperationException("A retired PIN cannot be seeded or reused.");
         if (!await db.CrewMembers.AnyAsync(x => x.Pin == pin))
             db.CrewMembers.Add(new CrewMember { Pin = pin });
 

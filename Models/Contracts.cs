@@ -25,6 +25,7 @@ public sealed record EnvironmentRequest(string ClientReadingId, DateTimeOffset M
 public sealed record EnvironmentResponse(string ReadingId, string ClientReadingId, string Pin,
     DateTimeOffset ReceivedAt, string Status);
 public sealed record PhotoResponse(string MeasurementId, string PhotoStatus, DateTimeOffset ReceivedAt);
+public sealed record EnvironmentReadingDto(string ReadingId, DateTimeOffset MeasuredAt, string DeviceId,
+    double TemperatureC, double RelativeHumidityPercent);
 public sealed record ApiErrorEnvelope(ApiError Error);
 public sealed record ApiError(string Code, string Message, string RequestId, IReadOnlyList<object> Details);
-

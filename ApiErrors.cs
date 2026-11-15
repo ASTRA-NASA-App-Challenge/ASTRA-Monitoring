@@ -1,95 +1,73 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
 using MonitoringApi.Models;
 
 namespace MonitoringApi;
+
+public static class ApiErrors
+{
+    public static ApiErrorEnvelope Envelope(HttpContext context, int status, string? code = null) =>
+        new(new ApiError(code ?? Code(status), Message(status), context.TraceIdentifier, []));
+    public static string Code(int status) => status switch
+    {
+        400 => "INVALID_REQUEST", 401 => "UNAUTHORIZED", 403 => "FORBIDDEN", 404 => "NOT_FOUND",
+        409 => "CONFLICT", 410 => "RESOURCE_RETIRED_OR_EXPIRED", 413 => "PAYLOAD_TOO_LARGE",
+        415 => "UNSUPPORTED_MEDIA_TYPE", 422 => "INVALID_VALUE", 429 => "RATE_LIMITED",
+        503 => "SERVICE_UNAVAILABLE", _ => "REQUEST_FAILED"
+    };
+    private static string Message(int status) => status switch
+    {
+        400 => "The request is invalid.", 401 => "A valid API or device credential is required.",
+        403 => "This caller is not permitted to perform this operation.", 404 => "The requested resource was not found.",
+        409 => "The request conflicts with existing data.", 410 => "The PIN is retired or the upload has expired.",
+        413 => "The request exceeds the size limit.", 415 => "The media type is not supported.",
+        422 => "One or more values are outside the accepted range.", 429 => "Too many requests; retry later.",
+        503 => "An external service is temporarily unavailable.", _ => "The request could not be completed."
+    };
+    public static async Task WriteAsync(HttpContext context)
+    {
+        context.Response.ContentLength = null;
+        await context.Response.WriteAsJsonAsync(Envelope(context, context.Response.StatusCode),
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }, context.RequestAborted);
+    }
+}
+
+public sealed class ApiErrorResultFilter : IAlwaysRunResultFilter
+{
+    public void OnResultExecuting(ResultExecutingContext context)
+    {
+        var status = context.Result switch { ObjectResult o => o.StatusCode ?? 200, StatusCodeResult s => s.StatusCode, _ => 200 };
+        if (status >= 400 && context.Result is not ObjectResult { Value: ApiErrorEnvelope })
+            context.Result = new ObjectResult(ApiErrors.Envelope(context.HttpContext, status)) { StatusCode = status };
+    }
+    public void OnResultExecuted(ResultExecutedContext context) { }
+}
 
 public sealed class ApiErrorMiddleware(RequestDelegate next, ILogger<ApiErrorMiddleware> logger)
 {
     public async Task Invoke(HttpContext context)
     {
-        var tracker = new TrackingWriteStream(context.Response.Body);
-        context.Response.Body = tracker;
-        try
-        {
-            await next(context);
-        }
+        try { await next(context); }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
         catch (Exception exception)
         {
-            logger.LogError("Unhandled API exception for request {RequestId}: {ExceptionType}", context.TraceIdentifier, exception.GetType().Name);
-            if (!context.Response.HasStarted)
+            logger.LogError(exception, "API request {RequestId} failed with {ExceptionType}", context.TraceIdentifier, exception.GetType().Name);
+            if (context.Response.HasStarted) { context.Abort(); return; }
+            context.Response.Clear();
+            context.Response.StatusCode = exception switch
             {
-                context.Response.Clear();
-                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                tracker.Reset();
-            }
-        }
-        finally
-        {
-            context.Response.Body = tracker.Inner;
-        }
-        if (context.Response.StatusCode >= 400 && tracker.BytesWritten == 0 && !context.Response.HasStarted)
-        {
-            var (code, message) = context.Response.StatusCode switch
-            {
-                400 => ("INVALID_REQUEST", "The request could not be accepted."),
-                401 => ("UNAUTHORIZED", "Authentication is required or invalid."),
-                403 => ("FORBIDDEN", "The request is not permitted."),
-                404 => ("NOT_FOUND", "The requested resource was not found."),
-                409 => ("CONFLICT", "The request conflicts with an existing resource."),
-                410 => ("UPLOAD_CLOSED", "The photo upload is closed or expired."),
-                413 => ("PAYLOAD_TOO_LARGE", "The uploaded photo exceeds the allowed size."),
-                415 => ("UNSUPPORTED_MEDIA_TYPE", "The media type is not supported."),
-                422 => ("INVALID_VALUE", "One or more values are outside the accepted range."),
-                423 => ("TEMPORARY_LOCKOUT", "Authentication is temporarily locked."),
-                429 => ("RATE_LIMITED", "Too many requests. Try again later."),
-                _ => ("REQUEST_FAILED", "The request could not be completed.")
+                BadHttpRequestException bad => bad.StatusCode,
+                HttpRequestException or TaskCanceledException => 503,
+                _ => 500
             };
-            context.Response.ContentLength = null;
-            context.Response.ContentType = "application/json";
-            var envelope = new ApiErrorEnvelope(new ApiError(code, message, RequestId(context), []));
-            await JsonSerializer.SerializeAsync(context.Response.Body, envelope, JsonOptions, context.RequestAborted);
+            await ApiErrors.WriteAsync(context);
         }
-    }
-
-    public static string RequestId(HttpContext context)
-    {
-        var id = $"req_{Guid.NewGuid():N}";
-        context.Items["api_request_id"] = id;
-        return id;
-    }
-
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
-
-    private sealed class TrackingWriteStream(Stream inner) : Stream
-    {
-        public Stream Inner => inner;
-        public long BytesWritten { get; private set; }
-        public void Reset() => BytesWritten = 0;
-        public override bool CanRead => false;
-        public override bool CanSeek => false;
-        public override bool CanWrite => true;
-        public override long Length => throw new NotSupportedException();
-        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-        public override void Flush() => inner.Flush();
-        public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
-        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) { inner.Write(buffer, offset, count); BytesWritten += count; }
-        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
-        { await inner.WriteAsync(buffer, cancellationToken); BytesWritten += buffer.Length; }
-        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-        { await inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken); BytesWritten += count; }
     }
 }
 
 public sealed class ApiValidationResponseFactory
 {
-    public static IActionResult Create(ActionContext context)
-    {
-        var error = new ApiError("INVALID_REQUEST", "The request could not be accepted.",
-            ApiErrorMiddleware.RequestId(context.HttpContext), []);
-        return new BadRequestObjectResult(new ApiErrorEnvelope(error));
-    }
+    public static IActionResult Create(ActionContext context) =>
+        new BadRequestObjectResult(ApiErrors.Envelope(context.HttpContext, 400));
 }
