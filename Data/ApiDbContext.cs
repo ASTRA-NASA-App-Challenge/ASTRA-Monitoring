@@ -5,7 +5,7 @@ namespace MonitoringApi.Data;
 public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbContext(options)
 {
     public DbSet<DeviceRegistration> Devices => Set<DeviceRegistration>();
-    public DbSet<ApiSession> Sessions => Set<ApiSession>();
+    public DbSet<CrewMember> CrewMembers => Set<CrewMember>();
     public DbSet<Measurement> Measurements => Set<Measurement>();
     public DbSet<EnvironmentReading> EnvironmentReadings => Set<EnvironmentReading>();
 
@@ -13,23 +13,18 @@ public sealed class ApiDbContext(DbContextOptions<ApiDbContext> options) : DbCon
     {
         modelBuilder.Entity<DeviceRegistration>().HasKey(x => x.DeviceId);
         modelBuilder.Entity<DeviceRegistration>().Property(x => x.CredentialHash).IsRequired();
-        modelBuilder.Entity<ApiSession>().HasKey(x => x.Id);
-        modelBuilder.Entity<ApiSession>().HasIndex(x => x.AccessTokenHash).IsUnique();
-        modelBuilder.Entity<ApiSession>().HasIndex(x => x.RefreshTokenHash).IsUnique();
-        modelBuilder.Entity<ApiSession>().Property(x => x.AccessExpiresAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
-        modelBuilder.Entity<ApiSession>().Property(x => x.RefreshExpiresAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
-        modelBuilder.Entity<ApiSession>().Property(x => x.CreatedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
-        modelBuilder.Entity<ApiSession>().Property(x => x.RevokedAt).HasConversion(x => x.HasValue ? x.Value.UtcTicks : (long?)null,
-            x => x.HasValue ? new DateTimeOffset(x.Value, TimeSpan.Zero) : null);
+        modelBuilder.Entity<CrewMember>().HasKey(x => x.Pin);
+        modelBuilder.Entity<Measurement>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<EnvironmentReading>().HasOne<CrewMember>().WithMany().HasForeignKey(x => x.Pin).OnDelete(DeleteBehavior.Restrict);
         modelBuilder.Entity<Measurement>().HasKey(x => x.Id);
-        modelBuilder.Entity<Measurement>().HasIndex(x => new { x.AstronautId, x.MeasuredAt });
+        modelBuilder.Entity<Measurement>().HasIndex(x => new { AstronautId = x.Pin, x.MeasuredAt });
         modelBuilder.Entity<Measurement>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<Measurement>().Property(x => x.CreatedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<Measurement>().Property(x => x.PhotoExpiresAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<Measurement>().Property(x => x.PhotoReceivedAt).HasConversion(x => x.HasValue ? x.Value.UtcTicks : (long?)null,
             x => x.HasValue ? new DateTimeOffset(x.Value, TimeSpan.Zero) : null);
         modelBuilder.Entity<EnvironmentReading>().HasKey(x => x.Id);
-        modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { x.AstronautId, x.MeasuredAt });
+        modelBuilder.Entity<EnvironmentReading>().HasIndex(x => new { AstronautId = x.Pin, x.MeasuredAt });
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.MeasuredAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
         modelBuilder.Entity<EnvironmentReading>().Property(x => x.ReceivedAt).HasConversion(x => x.UtcTicks, x => new DateTimeOffset(x, TimeSpan.Zero));
     }
@@ -45,25 +40,14 @@ public sealed class DeviceRegistration
     public bool Active { get; set; } = true;
 }
 
-public sealed class ApiSession
-{
-    public required string Id { get; set; }
-    public required string AstronautId { get; set; }
-    public required string UnoDeviceId { get; set; }
-    public required string AccessTokenHash { get; set; }
-    public DateTimeOffset AccessExpiresAt { get; set; }
-    public required string RefreshTokenHash { get; set; }
-    public DateTimeOffset RefreshExpiresAt { get; set; }
-    public DateTimeOffset CreatedAt { get; set; }
-    public DateTimeOffset? RevokedAt { get; set; }
-}
+public sealed class CrewMember { public required string Pin { get; set; } public static bool IsValid(string? pin) => pin is { Length: 6 } && pin.All(c => c is >= '0' and <= '9'); }
 
 public sealed class Measurement
 {
     public required string Id { get; set; }
     public required string ClientMeasurementId { get; set; }
-    public required string AstronautId { get; set; }
-    public required string SessionId { get; set; }
+    public required string Pin { get; set; }
+
     public required string UnoDeviceId { get; set; }
     public required string CameraDeviceId { get; set; }
     public DateTimeOffset MeasuredAt { get; set; }
@@ -89,8 +73,8 @@ public sealed class EnvironmentReading
 {
     public required string Id { get; set; }
     public required string ClientReadingId { get; set; }
-    public required string SessionId { get; set; }
-    public required string AstronautId { get; set; }
+
+    public required string Pin { get; set; }
     public required string DeviceId { get; set; }
     public DateTimeOffset MeasuredAt { get; set; }
     public DateTimeOffset ReceivedAt { get; set; }
@@ -99,3 +83,4 @@ public sealed class EnvironmentReading
     public string IdempotencyKey { get; set; } = Guid.NewGuid().ToString();
     public double RelativeHumidityPercent { get; set; }
 }
+

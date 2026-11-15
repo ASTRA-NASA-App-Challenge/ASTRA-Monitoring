@@ -16,18 +16,21 @@ namespace MonitoringApi.Controllers;
 
 [ApiController]
 [AllowAnonymous]
-[Route("api/v1")]
-public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment environment, SupabasePhotoStorage photoStorage) : ControllerBase
+[Route("api/v1/crew/{pin}")]
+public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment environment, SupabasePhotoStorage photoStorage) : ControllerBase, Microsoft.AspNetCore.Mvc.Filters.IAsyncActionFilter
 {
+    [NonAction]
+    public async Task OnActionExecutionAsync(Microsoft.AspNetCore.Mvc.Filters.ActionExecutingContext context, Microsoft.AspNetCore.Mvc.Filters.ActionExecutionDelegate next)
+    {
+        var pin = context.RouteData.Values["pin"]?.ToString();
+        if (!CrewMember.IsValid(pin) || !await db.CrewMembers.AnyAsync(x => x.Pin == pin)) { context.Result = NotFound("Unknown crew PIN."); return; }
+        await next();
+    }
     private const long MaxPhotoBytes = 5 * 1024 * 1024;
     private static readonly string[] Dimensions = ["160x120", "320x240"];
 
-    // --- No-auth replacements for claims ---
-    private string AstronautId => Request.Headers["X-Astronaut-Id"].FirstOrDefault() is { Length: > 0 } h ? h : "dev-astronaut";
-    private string SessionId   => Request.Headers["X-Session-Id"].FirstOrDefault()   is { Length: > 0 } h ? h : "dev-session";
-
     [HttpPost("measurements")]
-    public async Task<IActionResult> CreateMeasurement([FromBody] CreateMeasurementRequest body)
+    public async Task<IActionResult> CreateMeasurement(string pin, [FromBody] CreateMeasurementRequest body)
     {
         if (!Guid.TryParse(body.ClientMeasurementId, out _) || body.MeasuredAt.Offset != TimeSpan.Zero
             || body.Pulse.Bpm is < 0 or > 250 || body.Pulse.Quality is not ("good" or "fair" or "poor" or "unknown")
@@ -39,13 +42,13 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
 
         var camera = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == body.Photo.CameraId && x.Kind == "camera");
         if (camera is null) return NotFound("Unknown camera device");
-        var unoId = camera.PairedDeviceId;
+        var unoId = camera.PairedDeviceId; if (!camera.Active || string.IsNullOrEmpty(unoId)) return BadRequest("Camera must be active and paired.");
 
         var now = DateTimeOffset.UtcNow;
         var item = new Measurement
         {
             Id = $"mea_{Guid.NewGuid():N}", ClientMeasurementId = body.ClientMeasurementId,
-            AstronautId = AstronautId, SessionId = SessionId,
+            Pin = pin,
             UnoDeviceId = unoId, CameraDeviceId = camera.DeviceId, MeasuredAt = body.MeasuredAt, CreatedAt = now,
             Bpm = body.Pulse.Bpm, Quality = body.Pulse.Quality, AlgorithmVersion = body.Pulse.AlgorithmVersion,
             PulseStatusReason = body.Pulse.StatusReason,
@@ -59,13 +62,13 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
     }
 
     [HttpGet("measurements/{measurementId}")]
-    public async Task<IActionResult> GetMeasurement(string measurementId)
+    public async Task<IActionResult> GetMeasurement(string pin, string measurementId)
     {
-        var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId);
+        var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId && x.Pin == pin);
         if (item is null) return NotFound();
         if (item.PhotoStatus == "awaiting_upload" && item.PhotoExpiresAt <= DateTimeOffset.UtcNow)
         {
-            var expired = await db.Measurements.SingleAsync(x => x.Id == measurementId);
+            var expired = await db.Measurements.SingleAsync(x => x.Id == measurementId && x.Pin == pin);
             expired.PhotoStatus = "expired";
             await db.SaveChangesAsync(HttpContext.RequestAborted);
             item.PhotoStatus = "expired";
@@ -75,9 +78,9 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
 
     [HttpPut("measurements/{measurementId}/photo")]
     [RequestSizeLimit(MaxPhotoBytes)]
-    public async Task<IActionResult> UploadPhoto(string measurementId)
+    public async Task<IActionResult> UploadPhoto(string pin, string measurementId)
     {
-        var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId);
+        var item = await db.Measurements.SingleOrDefaultAsync(x => x.Id == measurementId && x.Pin == pin);
         if (item is null) return NotFound();
         if (!string.Equals(Request.ContentType?.Split(';')[0].Trim(), item.MediaType, StringComparison.OrdinalIgnoreCase))
             return StatusCode(415);
@@ -120,7 +123,7 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
             }
 
             await using var uploadStream = System.IO.File.OpenRead(normalizedPath);
-            var publicUrl = await photoStorage.UploadAsync(uploadStream, $"{item.Id}.jpg", "image/jpeg", HttpContext.RequestAborted);
+            var publicUrl = await photoStorage.UploadAsync(uploadStream, $"{item.Pin}/{item.Id}.jpg", "image/jpeg", HttpContext.RequestAborted);
 
             item.PhotoPath = publicUrl;
             item.PhotoSha256 = digest;
@@ -138,8 +141,8 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         }
     }
 
-    [HttpGet("astronauts/{astronautId}/measurements")]
-    public async Task<IActionResult> History(string astronautId, [FromQuery] DateTimeOffset? from = null,
+    [HttpGet("measurements")]
+    public async Task<IActionResult> History(string pin, [FromQuery] DateTimeOffset? from = null,
         [FromQuery] DateTimeOffset? to = null, [FromQuery] int limit = 50, [FromQuery] string? cursor = null)
     {
         limit = Math.Clamp(limit, 1, 100);
@@ -147,7 +150,7 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         var start = from ?? end.AddDays(-31);
         if (start.Offset != TimeSpan.Zero || end.Offset != TimeSpan.Zero || end < start || end - start > TimeSpan.FromDays(31))
             return UnprocessableEntity();
-        var query = db.Measurements.AsNoTracking().Where(x => x.AstronautId == astronautId && x.MeasuredAt >= start && x.MeasuredAt <= end);
+        var query = db.Measurements.AsNoTracking().Where(x => x.Pin == pin && x.MeasuredAt >= start && x.MeasuredAt <= end);
         if (cursor is not null)
         {
             if (!TryDecodeCursor(cursor, out var ticks, out var id)) return BadRequest();
@@ -159,32 +162,32 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         if (hasMore) page.RemoveAt(page.Count - 1);
         var next = hasMore && page.Count > 0 ? EncodeCursor(page[^1].MeasuredAt, page[^1].Id) : null;
         var items = page.Select(x => new HistoryMeasurementDto(x.Id, x.MeasuredAt, new PulseSummary(x.Bpm, x.Quality, x.PulseStatusReason),
-            x.PhotoStatus == "uploaded" ? $"/api/v1/measurements/{x.Id}/photo" : null)).ToArray();
+            x.PhotoStatus == "uploaded" ? $"/api/v1/crew/{x.Pin}/measurements/{x.Id}/photo" : null)).ToArray();
         return Ok(new PageDto<HistoryMeasurementDto>(items, next));
     }
 
     [HttpGet("measurements/{measurementId}/photo")]
-    public async Task<IActionResult> GetPhoto(string measurementId)
+    public async Task<IActionResult> GetPhoto(string pin, string measurementId)
     {
-        var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId);
+        var item = await db.Measurements.AsNoTracking().SingleOrDefaultAsync(x => x.Id == measurementId && x.Pin == pin);
         if (item is null) return NotFound();
         if (item.PhotoStatus != "uploaded" || item.PhotoPath is null || string.IsNullOrWhiteSpace(item.PhotoPath)) return NotFound();
         Response.Headers["Cache-Control"] = "private, no-store";
-        return Redirect(item.PhotoPath);
+        return File(await photoStorage.DownloadAsync(item.PhotoPath, HttpContext.RequestAborted), "image/jpeg");
     }
 
     [HttpPost("environment-readings")]
-    public async Task<IActionResult> Environment([FromBody] EnvironmentRequest body)
+    public async Task<IActionResult> Environment(string pin, [FromBody] EnvironmentRequest body)
     {
         var unoId = body.DeviceId;
         if (!Guid.TryParse(body.ClientReadingId, out _) || body.Sensor != "DHT11" || body.MeasuredAt.Offset != TimeSpan.Zero || !double.IsFinite(body.TemperatureC)
             || !double.IsFinite(body.RelativeHumidityPercent) || body.TemperatureC is < 0 or > 50
             || body.RelativeHumidityPercent is < 0 or > 100) return UnprocessableEntity();
-        var sessionId = SessionId;
+
         var reading = new EnvironmentReading
         {
             Id = $"env_{Guid.NewGuid():N}", ClientReadingId = body.ClientReadingId,
-            SessionId = sessionId, AstronautId = AstronautId, DeviceId = unoId,
+            Pin = pin, DeviceId = unoId,
             MeasuredAt = body.MeasuredAt, ReceivedAt = DateTimeOffset.UtcNow, TemperatureC = body.TemperatureC,
             RelativeHumidityPercent = body.RelativeHumidityPercent
         };
@@ -193,10 +196,15 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         return StatusCode(201, EnvironmentResponseFor(reading));
     }
 
-    private CreateMeasurementResponse CreatedMeasurement(Measurement x) => new(x.Id, x.ClientMeasurementId, x.AstronautId,
+    [HttpGet("environment-readings")]
+    public async Task<IActionResult> EnvironmentHistory(string pin, [FromQuery] int limit = 50) =>
+        Ok(await db.EnvironmentReadings.AsNoTracking().Where(x => x.Pin == pin)
+            .OrderByDescending(x => x.MeasuredAt).Take(Math.Clamp(limit, 1, 100)).ToListAsync(HttpContext.RequestAborted));
+
+    private CreateMeasurementResponse CreatedMeasurement(Measurement x) => new(x.Id, x.ClientMeasurementId, x.Pin,
         x.CreatedAt, x.PhotoStatus, x.PhotoExpiresAt);
     private static MeasurementDto ToMeasurement(Measurement x) => new(x.Id, x.MeasuredAt, new PulseSummary(x.Bpm, x.Quality, x.PulseStatusReason),
-        x.PhotoStatus, x.PhotoStatus == "uploaded" ? $"/api/v1/measurements/{x.Id}/photo" : null);
+        x.PhotoStatus, x.PhotoStatus == "uploaded" ? $"/api/v1/crew/{x.Pin}/measurements/{x.Id}/photo" : null);
     private static bool ValidWaveform(WaveformDto? x) => x is null ||
         (x.SampleRateHz is > 0 and <= 200 && x.AdcResolutionBits is > 0 and <= 16 && x.Samples.Length <= 4000
          && x.Samples.Length <= x.SampleRateHz * 20 && x.Samples.All(n => n >= 0 && n < (1 << x.AdcResolutionBits)));
@@ -211,7 +219,7 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
         && x.MeasuredAt == b.MeasuredAt && x.DeviceId == b.DeviceId && x.TemperatureC == b.TemperatureC
         && x.RelativeHumidityPercent == b.RelativeHumidityPercent;
     private static EnvironmentResponse EnvironmentResponseFor(EnvironmentReading x) =>
-        new(x.Id, x.ClientReadingId, x.AstronautId, x.ReceivedAt, "accepted");
+        new(x.Id, x.ClientReadingId, x.Pin, x.ReceivedAt, "accepted");
     private async Task<string> HashRequestBody()
     {
         using var sha = SHA256.Create();
@@ -266,3 +274,5 @@ public sealed class MonitoringController(ApiDbContext db, IWebHostEnvironment en
 
 public sealed record HistoryMeasurementDto(string MeasurementId, DateTimeOffset MeasuredAt, PulseSummary Pulse, string? PhotoUrl);
 public sealed class PayloadTooLargeException : Exception { }
+
+

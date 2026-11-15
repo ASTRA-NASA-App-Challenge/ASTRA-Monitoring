@@ -111,7 +111,7 @@ public sealed class DemoDataSeeder(
                 {
                     Id = $"mea_seed_{Guid.NewGuid():N}",
                     ClientMeasurementId = Guid.NewGuid().ToString(),
-                    AstronautId = astronaut.Id,
+                    Pin = astronaut.Id,
                     SessionId = sessionId,
                     UnoDeviceId = uno.DeviceId,
                     CameraDeviceId = camera.DeviceId,
@@ -136,7 +136,7 @@ public sealed class DemoDataSeeder(
                     Id = $"env_seed_{Guid.NewGuid():N}",
                     ClientReadingId = Guid.NewGuid().ToString(),
                     SessionId = sessionId,
-                    AstronautId = astronaut.Id,
+                    Pin = astronaut.Id,
                     DeviceId = uno.DeviceId,
                     MeasuredAt = measured,
                     ReceivedAt = measured.AddSeconds(1),

@@ -13,7 +13,7 @@ public sealed class SupabasePhotoStorage(IConfiguration configuration, ILogger<S
             throw new InvalidOperationException("Supabase URL and ServiceRoleKey must be configured.");
 
         var bucket = configuration["Supabase:Bucket"] ?? "photos";
-        var path = $"{DateTimeOffset.UtcNow:yyyy/MM/dd}/{Guid.NewGuid():N}_{fileName}";
+        var path = fileName;
         var url = $"{_url.TrimEnd('/')}/storage/v1/object/{bucket}/{path}";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, url);
@@ -37,8 +37,13 @@ public sealed class SupabasePhotoStorage(IConfiguration configuration, ILogger<S
     public async Task<Stream> DownloadAsync(string publicUrl, CancellationToken cancellationToken)
     {
         using var client = httpClientFactory.CreateClient();
-        var response = await client.GetAsync(publicUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        var authenticatedUrl = publicUrl.Replace("/storage/v1/object/public/", "/storage/v1/object/authenticated/", StringComparison.Ordinal);
+        using var request = new HttpRequestMessage(HttpMethod.Get, authenticatedUrl);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _serviceRoleKey);
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStreamAsync(cancellationToken);
+        // Detach the returned stream from the HTTP response lifetime.
+        return new MemoryStream(await response.Content.ReadAsByteArrayAsync(cancellationToken));
     }
 }
+
