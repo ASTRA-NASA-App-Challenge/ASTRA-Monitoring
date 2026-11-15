@@ -11,6 +11,13 @@ using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 DotEnvConfiguration.Add(builder.Configuration, builder.Environment.ContentRootPath, args);
+// The explicitly invoked demo tool can use a private loopback host without re-provisioning
+// installed hardware or running unrelated background cleanup. Authentication is unchanged.
+var demoSeedHost = builder.Configuration.GetValue<bool>("DemoSeedHost");
+if (demoSeedHost && (!builder.Environment.IsDevelopment()
+    || (builder.Configuration["urls"] ?? "").Split(';').Any(address =>
+        !Uri.TryCreate(address, UriKind.Absolute, out var uri) || !uri.IsLoopback)))
+    throw new InvalidOperationException("The demo seed host requires Development and explicit loopback URLs.");
 var connection = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? "Data Source=monitoring.db;Foreign Keys=True";
 var sqlite = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(connection) { ForeignKeys = true };
@@ -22,7 +29,7 @@ builder.Services.AddHttpClient("supabase", client => client.Timeout = TimeSpan.F
 builder.Services.AddScoped<SupabasePhotoStorage>();
 builder.Services.AddScoped<CrewDeletion>();
 builder.Services.AddScoped<PhotoOrphanCleanup>();
-builder.Services.AddHostedService<PhotoCleanupWorker>();
+if (!demoSeedHost) builder.Services.AddHostedService<PhotoCleanupWorker>();
 builder.Services.AddSingleton<IPasswordHasher<DeviceRegistration>, PasswordHasher<DeviceRegistration>>();
 builder.Services.AddAuthentication(ApiAccess.SchemeName).AddScheme<AuthenticationSchemeOptions, ApiAccess>(ApiAccess.SchemeName, _ => { });
 builder.Services.AddAuthorization(o => o.AddPolicy("web", p => p.RequireAuthenticatedUser().RequireClaim("caller", "web")));
@@ -53,31 +60,34 @@ await using (var scope = app.Services.CreateAsyncScope())
     }
     if (builder.Configuration["MonitoringApi:WebApiKey"] is not { Length: >= 32 and <= 512 })
         throw new InvalidOperationException("Set MonitoringApi:WebApiKey to a secret of 32 to 512 characters.");
-    var configuredDevices = builder.Configuration.GetSection("MonitoringApi:Devices").GetChildren().ToArray();
-    var configuredIds = configuredDevices.Select(x => x["DeviceId"]).ToHashSet();
-    foreach (var old in await db.Devices.ToListAsync())
-        if (!configuredIds.Contains(old.DeviceId)) old.Active = false;
-    foreach (var item in configuredDevices)
+    if (!demoSeedHost)
     {
-        var id = item["DeviceId"];
-        var kind = item["Kind"];
-        if (string.IsNullOrWhiteSpace(id) || kind is not ("uno" or "camera"))
-            throw new InvalidOperationException("Configured devices require DeviceId and Kind (uno or camera).");
-        var device = await db.Devices.FindAsync(id);
-        if (device is null)
+        var configuredDevices = builder.Configuration.GetSection("MonitoringApi:Devices").GetChildren().ToArray();
+        var configuredIds = configuredDevices.Select(x => x["DeviceId"]).ToHashSet();
+        foreach (var old in await db.Devices.ToListAsync())
+            if (!configuredIds.Contains(old.DeviceId)) old.Active = false;
+        foreach (var item in configuredDevices)
         {
-            device = new DeviceRegistration { DeviceId = id, Kind = kind, CredentialHash = "" };
-            db.Devices.Add(device);
+            var id = item["DeviceId"];
+            var kind = item["Kind"];
+            if (string.IsNullOrWhiteSpace(id) || kind is not ("uno" or "camera"))
+                throw new InvalidOperationException("Configured devices require DeviceId and Kind (uno or camera).");
+            var device = await db.Devices.FindAsync(id);
+            if (device is null)
+            {
+                device = new DeviceRegistration { DeviceId = id, Kind = kind, CredentialHash = "" };
+                db.Devices.Add(device);
+            }
+            device.Kind = kind;
+            device.PairedDeviceId = item["PairedDeviceId"];
+            device.Active = true;
+            var credential = item["Credential"];
+            if (credential is not { Length: >= 16 and <= 512 })
+                throw new InvalidOperationException("Each device needs a Credential of 16 to 512 characters matching its firmware configuration.");
+            device.CredentialHash = scope.ServiceProvider.GetRequiredService<IPasswordHasher<DeviceRegistration>>().HashPassword(device, credential);
         }
-        device.Kind = kind;
-        device.PairedDeviceId = item["PairedDeviceId"];
-        device.Active = true;
-        var credential = item["Credential"];
-        if (credential is not { Length: >= 16 and <= 512 })
-            throw new InvalidOperationException("Each device needs a Credential of 16 to 512 characters matching its firmware configuration.");
-        device.CredentialHash = scope.ServiceProvider.GetRequiredService<IPasswordHasher<DeviceRegistration>>().HashPassword(device, credential);
+        await db.SaveChangesAsync();
     }
-    await db.SaveChangesAsync();
 }
 app.UseMiddleware<ApiErrorMiddleware>();
 app.UseStatusCodePages(async ctx => await ApiErrors.WriteAsync(ctx.HttpContext));

@@ -63,6 +63,13 @@ In Development, run `dotnet run -- --seed-pin=123456` to create seven synthetic 
 
 ## Verification
 
+The complete six-PIN presentation dataset has an explicitly invoked tool, real private portraits, and a separate latest-reading refresh command. See [Tools/DemoSeeder/README.md](Tools/DemoSeeder/README.md).
+
+```powershell
+dotnet run --project Tools/DemoSeeder --artifacts-path ./bin/demo-build -- prepare
+dotnet run --project Tools/DemoSeeder --artifacts-path ./bin/demo-build -- refresh
+```
+
 - `dotnet test Tests/MonitoringApi.Tests.csproj`
 - `dotnet test ../ASTRA-Web/ASTRA-Web/Tests/Tests.csproj`
 
