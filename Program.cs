@@ -19,6 +19,13 @@ await using (var scope = app.Services.CreateAsyncScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ApiDbContext>();
     await db.Database.EnsureCreatedAsync();
+    if (builder.Configuration["seed-pin"] is { } seedPin)
+    {
+        if (!app.Environment.IsDevelopment())
+            throw new InvalidOperationException("Sample data can only be seeded in Development.");
+        await PinSampleSeeder.SeedAsync(db, seedPin);
+        return;
+    }
     foreach (var item in builder.Configuration.GetSection("MonitoringApi:Devices").GetChildren())
     {
         var id = item["DeviceId"];

@@ -1,6 +1,6 @@
 # ASTRA Monitoring
 
-Standalone SQLite API. Only six-digit string PINs are stored in CrewMembers. Measurement and environment rows reference the PIN through foreign keys. Web accounts remain separate; no synchronization is enabled.
+Standalone SQLite API. Only six-digit string PINs are stored in CrewMembers. Measurement and environment rows reference the PIN through foreign keys. Web accounts remain separate. ASTRA-Web registers each member PIN; dashboard data and photo display are deferred. Its MonitoringApi__BaseUrl setting points to this host (http://localhost:5191/ by default). Registration is attempted immediately after creation and reconciled every 30 seconds from web SQLite, including after outages.
 
 POST /api/v1/crew with {"pin":"012345"} registers a PIN (201 created, 409 duplicate). GET /api/v1/crew/{pin} checks it. Under /api/v1/crew/{pin}, POST/GET measurements creates/lists measurements; GET measurements/{id} retrieves one; PUT/GET measurements/{id}/photo uploads/retrieves a photo; POST/GET environment-readings creates/lists telemetry. Unknown PINs are rejected. Photos use bucket paths {pin}/{measurementId}.jpg.
 
@@ -13,4 +13,8 @@ Configure cameras with MonitoringApi__Devices__0__DeviceId, MonitoringApi__Devic
 Use a fresh SQLite file for this schema. Existing monitoring databases need an explicit migration and old-account-to-PIN mapping; EnsureCreated does not upgrade them. Back up existing data and select a new filename before starting. Legacy Identity/session/demo sources are excluded from compilation. No remote database changes were made.
 
 PIN routes identify data and do not provide account authentication. Photo retrieval streams through the server using its Supabase service key and supports private buckets. JPEG/RGB565 validation and the 5 MiB upload limit remain.
+
+
+
+Seed synthetic readings for PIN 123456 in Development with: dotnet run -- --seed-pin=123456. This creates seven measurements and seven environment readings, preserves existing data, and does not duplicate samples on repeated runs. No username is needed and no photos are uploaded.
 
