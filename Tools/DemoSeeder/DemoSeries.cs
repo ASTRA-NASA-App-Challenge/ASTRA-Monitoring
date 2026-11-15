@@ -1,5 +1,4 @@
-using System.Security.Cryptography;
-using System.Text;
+using MonitoringApi.Data;
 using Common.Models;
 
 namespace Astra.Demo;
@@ -8,15 +7,14 @@ public sealed record Scenario(string Pin, int Bpm, double Temperature, double Hu
 public sealed record DemoSample(string Pin, int Slot, DateTimeOffset At, int Bpm, string Quality, string? Reason,
     double Temperature, double Humidity, bool HasPhoto)
 {
-    public string MeasurementClientId => StableId($"pulse:{Pin}:{Slot}");
-    public string EnvironmentClientId => StableId($"cabin:{Pin}:{Slot}");
-    private static string StableId(string value) => new Guid(SHA256.HashData(Encoding.UTF8.GetBytes("astra-presentation-v1:" + value)).AsSpan(0, 16)).ToString("D");
+    public string MeasurementClientId => DemoSeedContract.ClientId("pulse", Pin, Slot);
+    public string EnvironmentClientId => DemoSeedContract.ClientId("cabin", Pin, Slot);
 }
 
 public static class DemoSeries
 {
-    public const string Algorithm = "synthetic-presentation-v1";
-    public const int SampleCount = 125; // 124 six-hour intervals cover exactly 31 days.
+    public const string Algorithm = DemoSeedContract.Algorithm;
+    public const int SampleCount = DemoSeedContract.SampleCount; // 124 six-hour intervals cover exactly 31 days.
     public static readonly Scenario[] Scenarios =
     [
         new("410201", 72, 22, 45, "good", 15),
@@ -27,7 +25,7 @@ public static class DemoSeries
         new("520304", 0, 22, 45, "unknown", 420)
     ];
 
-    public static IEnumerable<DemoSample> Samples(DateTimeOffset anchor, DateTimeOffset presentation)
+    public static IEnumerable<DemoSample> Samples(DateTimeOffset presentation)
     {
         foreach (var s in Scenarios)
         for (var i = 0; i < SampleCount; i++)

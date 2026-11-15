@@ -29,7 +29,13 @@ builder.Services.AddHttpClient("supabase", client => client.Timeout = TimeSpan.F
 builder.Services.AddScoped<SupabasePhotoStorage>();
 builder.Services.AddScoped<CrewDeletion>();
 builder.Services.AddScoped<PhotoOrphanCleanup>();
+builder.Services.AddSingleton<DemoSeedProgress>();
 if (!demoSeedHost) builder.Services.AddHostedService<PhotoCleanupWorker>();
+if (!demoSeedHost && builder.Configuration.GetValue("Demo:SeedOnStartup", builder.Environment.IsDevelopment()))
+{
+    builder.Services.AddSingleton<IStartupDemoPreparation, DemoSeedProcess>();
+    builder.Services.AddHostedService<StartupDemoSeed>();
+}
 builder.Services.AddSingleton<IPasswordHasher<DeviceRegistration>, PasswordHasher<DeviceRegistration>>();
 builder.Services.AddAuthentication(ApiAccess.SchemeName).AddScheme<AuthenticationSchemeOptions, ApiAccess>(ApiAccess.SchemeName, _ => { });
 builder.Services.AddAuthorization(o => o.AddPolicy("web", p => p.RequireAuthenticatedUser().RequireClaim("caller", "web")));

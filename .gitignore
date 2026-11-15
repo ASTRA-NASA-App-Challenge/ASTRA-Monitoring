@@ -398,7 +398,6 @@ healthchecksdb
 *.db
 *.db-shm
 *.db-wal
-.demo/
 App_Data/photos/
 .demo-credentials.json
 

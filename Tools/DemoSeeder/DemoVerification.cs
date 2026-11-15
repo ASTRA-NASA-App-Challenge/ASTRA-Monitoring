@@ -41,7 +41,7 @@ public static class DemoVerification
             var monthCabin = await ReadAsync<EnvironmentReadingDto>(api, scenario.Pin, "environment-readings", to.AddDays(-30), to);
             var weekCabin = await ReadAsync<EnvironmentReadingDto>(api, scenario.Pin, "environment-readings", to.AddDays(-7), to);
             if (month.Items.Count <= 100 || month.Pages < 2 || monthCabin.Items.Count <= 100 || monthCabin.Pages < 2)
-                throw new InvalidOperationException("Month did not exercise cursor pagination; the persisted demo anchor may be too old.");
+                throw new InvalidOperationException("Month did not exercise cursor pagination; the demo readings may be too old; run refresh.");
             if (week.Items.Count >= month.Items.Count || weekCabin.Items.Count >= monthCabin.Items.Count)
                 throw new InvalidOperationException("Week and Month are not visibly different.");
             if (month.Items.Select(x => x.MeasurementId).Distinct().Count() != month.Items.Count

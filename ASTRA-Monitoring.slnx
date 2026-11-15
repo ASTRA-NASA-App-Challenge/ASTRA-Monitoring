@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="ASTRA-Monitoring.csproj" />
+  <Folder Name="/Tools/">
+    <Project Path="Tools/DemoSeeder/DemoSeeder.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/MonitoringApi.Tests.csproj" />
+  </Folder>
+</Solution>

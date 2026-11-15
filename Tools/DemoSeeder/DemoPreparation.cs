@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using MonitoringApi.Data;
 using MonitoringApi.Models;
+using MonitoringApi.Controllers;
 
 namespace Astra.Demo;
 
@@ -14,7 +15,21 @@ public static class DemoPreparation
         var cabin = await db.EnvironmentReadings.AsNoTracking().Where(x => cabinIds.Contains(x.ClientReadingId)).ToDictionaryAsync(x => x.ClientReadingId);
         var assets = new Dictionary<string, byte[]>();
         foreach (var pin in DemoSeries.Scenarios.Select(x => x.Pin)) assets[pin] = await File.ReadAllBytesAsync(Path.Combine(root, "Tools", "DemoSeeder", "Assets", pin + ".jpg"));
-        foreach (var group in samples.OrderByDescending(x => x.HasPhoto).ThenBy(x => x.Pin).ThenBy(x => x.Slot).GroupBy(x => new { x.Pin, x.HasPhoto }))
+        // Populate every member's recent history first. A bounded request amortizes HTTP
+        // overhead while the server uses the same creation handlers for every record.
+        foreach (var group in samples.Where(x => !x.HasPhoto).GroupBy(x => x.Pin))
+        {
+            var missing = group.Where(x => !pulses.ContainsKey(x.MeasurementClientId) || !cabin.ContainsKey(x.EnvironmentClientId)).ToList();
+            if (missing.Count == 0) continue;
+            var items = missing.Select(sample => new DemoHistoryItem(
+                new CreateMeasurementRequest(sample.MeasurementClientId, sample.At,
+                    new PulseDto(sample.Bpm, sample.Quality, DemoSeries.Algorithm, null, sample.Reason),
+                    new PhotoExpectationDto(state.CameraId!, "image/jpeg", 320, 240)),
+                new EnvironmentRequest(sample.EnvironmentClientId, sample.At, state.UnoId!, "DHT11", sample.Temperature, sample.Humidity))).ToList();
+            var result = await api.JsonAsync<DemoHistoryResponse>(HttpMethod.Post, $"api/v1/crew/{group.Key}/demo-history", new DemoHistoryRequest(items));
+            Console.WriteLine($"{group.Key}: history ready; {result.MeasurementsCreated} pulse and {result.EnvironmentReadingsCreated} cabin readings added.");
+        }
+        foreach (var group in samples.Where(x => x.HasPhoto).OrderBy(x => x.Slot).ThenBy(x => x.Pin).GroupBy(x => new { x.Pin, x.HasPhoto }))
         {
             var created = 0; var reused = 0;
             foreach (var sample in group)

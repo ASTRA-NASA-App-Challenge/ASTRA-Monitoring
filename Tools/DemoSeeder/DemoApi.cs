@@ -7,7 +7,6 @@ namespace Astra.Demo;
 public sealed class DemoApi : IDisposable
 {
     private readonly HttpClient http;
-    private DateTimeOffset lastRequest;
     public DemoApi(Uri address, string key)
     {
         http = new HttpClient { BaseAddress = address, Timeout = TimeSpan.FromSeconds(45) };
@@ -32,10 +31,8 @@ public sealed class DemoApi : IDisposable
     {
         for (var attempt = 0; attempt < 15; attempt++)
         {
-            // Stay below the real server limit; do not disable or override the limiter.
-            var delay = lastRequest.AddMilliseconds(270) - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero) await Task.Delay(delay);
-            lastRequest = DateTimeOffset.UtcNow;
+            // History is batched, so a full seed now fits below the existing request
+            // limit. Honor 429 responses rather than adding a delay to every request.
             using var request = new HttpRequestMessage(method, path);
             if (body is not null)
             {

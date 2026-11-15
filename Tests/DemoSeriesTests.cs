@@ -9,7 +9,7 @@ public class DemoSeriesTests
     [Fact]
     public void LatestScenariosMatchTheActualPrototypeSeverityBoundaries()
     {
-        var samples = DemoSeries.Samples(Anchor, Anchor).ToList();
+        var samples = DemoSeries.Samples(Anchor).ToList();
         foreach (var scenario in DemoSeries.Scenarios)
         {
             var latest = samples.Where(x => x.Pin == scenario.Pin).MaxBy(x => x.At)!;
@@ -29,7 +29,7 @@ public class DemoSeriesTests
     {
         foreach (var scenario in DemoSeries.Scenarios)
         {
-            var samples = DemoSeries.Samples(Anchor, Anchor).Where(x => x.Pin == scenario.Pin).OrderBy(x => x.At).ToList();
+            var samples = DemoSeries.Samples(Anchor).Where(x => x.Pin == scenario.Pin).OrderBy(x => x.At).ToList();
             Assert.Equal(125, samples.Count);
             Assert.True(samples.Count > 100);
             Assert.True(samples.Count(x => x.At >= Anchor.AddDays(-7)) < samples.Count / 2);
@@ -51,11 +51,11 @@ public class DemoSeriesTests
     [Fact]
     public void IdentifiersAreStableAndRefreshMovesOnlyLatestTimestamps()
     {
-        var first = DemoSeries.Samples(Anchor, Anchor).ToList();
-        var repeat = DemoSeries.Samples(Anchor, Anchor).ToList();
+        var first = DemoSeries.Samples(Anchor).ToList();
+        var repeat = DemoSeries.Samples(Anchor).ToList();
         Assert.Equal(first, repeat);
         Assert.Equal(first.Count * 2, first.SelectMany(x => new[] { x.MeasurementClientId, x.EnvironmentClientId }).Distinct().Count());
-        var refreshed = DemoSeries.Samples(Anchor, Anchor.AddHours(1)).ToList();
+        var refreshed = DemoSeries.Samples(Anchor.AddHours(1)).ToList();
         for (var i = 0; i < first.Count; i++)
         {
             Assert.Equal(first[i].MeasurementClientId, refreshed[i].MeasurementClientId);

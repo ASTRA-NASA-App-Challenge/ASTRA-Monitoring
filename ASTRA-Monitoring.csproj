@@ -12,4 +12,8 @@
     <PackageReference Include="SixLabors.ImageSharp" Version="4.1.3" />
   </ItemGroup>
 <ItemGroup><Compile Remove="Identity/**/*.cs;Auth/**/*.cs;Data/DemoDataSeeder.cs;Tests/**/*.cs;Tools/**/*.cs" />
-<Content Remove="Tools/**/bin/**;Tools/**/obj/**" /><None Remove="Tools/**/bin/**;Tools/**/obj/**" /></ItemGroup></Project>
+<Content Remove="Tools/**/bin/**;Tools/**/obj/**" />
+<!-- Show the separate tool's source in Rider without adding it to server compilation. -->
+<None Remove="Tools/**/*.cs;Tools/**/*.csproj;Tools/**/bin/**;Tools/**/obj/**" />
+<None Include="Tools/**/*.cs;Tools/**/*.csproj" Exclude="Tools/**/bin/**;Tools/**/obj/**" Visible="true" />
+</ItemGroup></Project>

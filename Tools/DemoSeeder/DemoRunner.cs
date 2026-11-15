@@ -54,35 +54,24 @@ public static class DemoRunner
             }
             var key = configuration["MonitoringApi:WebApiKey"];
             if (key is not { Length: >= 32 and <= 512 }) throw new InvalidOperationException("Configured web API key is missing or invalid.");
-            var store = Path.Combine(root, ".demo", "presentation-v1", Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(sqlite.DataSource))))[..16]);
-            Directory.CreateDirectory(store);
-            await using var runLock = new FileStream(Path.Combine(store, "run.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-            var statePath = Path.Combine(store, "state.json");
-            var existed = File.Exists(statePath);
-            if (!existed && args[0] != "prepare") throw new InvalidOperationException("Run prepare before refresh or verify.");
-            if (!existed && await db.Measurements.AnyAsync(x => x.AlgorithmVersion == DemoSeries.Algorithm))
-                throw new InvalidOperationException("Demo rows already exist but their persisted anchor is missing. Restore .demo/presentation-v1 rather than generating duplicate history.");
-            var state = DemoState.Load(statePath);
-            if (state.Version != 1) throw new InvalidOperationException("Unsupported demo state version.");
-            if (state.CadenceVersion < 2 && args[0] is "refresh" or "verify")
-                throw new InvalidOperationException("Run prepare once to upgrade the demo to a complete six-hour timeline before refreshing or verifying it.");
-            var samples = DemoSeries.Samples(state.Anchor, state.Presentation).ToList();
+            // Temporary cross-process exclusion; no persisted demo manifest or timestamps.
+            var lockPath = Path.Combine(Path.GetTempPath(), "astra-demo-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(sqlite.DataSource))))[..16] + ".lock");
+            await using var runLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
+            var state = await DemoState.FromDatabaseAsync(db);
+            var samples = DemoSeries.Samples(state.Presentation).ToList();
             foreach (var pin in pins)
             {
                 var asset = Path.Combine(root, "Tools", "DemoSeeder", "Assets", pin + ".jpg");
                 if (!File.Exists(asset)) throw new InvalidOperationException($"Missing synthetic JPEG asset for {pin}.");
                 var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(asset)));
-                if (state.AssetHashes.TryGetValue(pin, out var previous) && previous != hash)
-                    throw new InvalidOperationException("A demo portrait changed. Restore the original asset to preserve photo idempotency.");
                 state.AssetHashes[pin] = hash;
             }
             await EnsureNoConflictingLatestAsync(db, state);
-            var before = await FingerprintAsync(db, samples, state);
             var storage = new DemoStorage(configuration);
             await storage.VerifyPrivateAsync();
-            if (args[0] != "verify") await EnsurePairAsync(db, state, statePath);
-            if (state.UnoId is null || state.CameraId is null) throw new InvalidOperationException("The persisted demo pair is missing.");
-            state.Save(statePath);
+            if (args[0] != "verify") await EnsurePairAsync(db, state, true);
+            var before = await FingerprintAsync(db, samples, state);
+            if (state.UnoId is null || state.CameraId is null) throw new InvalidOperationException("The demo pair is missing.");
             await using var host = await DemoHost.StartAsync(root, sqlite.ToString());
             using var api = new DemoApi(host.Address, key);
             if (args[0] == "prepare")
@@ -90,19 +79,16 @@ public static class DemoRunner
                 await AlignAsync(db, state, state.Presentation, false);
                 await DemoPreparation.PrepareAsync(db, api, storage, root, state, samples);
             }
-            if (args[0] == "refresh" || args[0] == "prepare" && (!state.Prepared || state.CadenceVersion < 2))
+            if (args[0] == "refresh" || args[0] == "prepare" && state.IsNew)
             {
                 await RefreshAsync(db, state);
-                state.Prepared = true;
-                state.CadenceVersion = 2;
-                state.Save(statePath);
             }
-            samples = DemoSeries.Samples(state.Anchor, state.Presentation).ToList();
+            samples = DemoSeries.Samples(state.Presentation).ToList();
+            Console.WriteLine("Verifying demo histories, pagination and authenticated photos.");
             var report = await DemoVerification.VerifyAsync(db, api, state, samples);
             var after = await FingerprintAsync(db, samples, state);
             if (before != after) throw new InvalidOperationException("Non-demo data changed during this run. No non-demo row is intentionally modified; check for concurrent application writes.");
-            await File.WriteAllTextAsync(Path.Combine(store, "report.json"), JsonSerializer.Serialize(report, Json));
-            Console.WriteLine("Non-demo data and all identities preserved. Portraits retrieved as authenticated JPEGs. Report: " + Path.Combine(store, "report.json"));
+            Console.WriteLine("Non-demo data and all identities preserved. Portraits retrieved as authenticated JPEGs. No demo state files are saved.");
             return 0;
         }
         catch (Exception ex)
@@ -127,55 +113,55 @@ public static class DemoRunner
             var planned = DateTimeOffset.UtcNow.AddMinutes(-scenario.AgeMinutes);
             if (await db.Measurements.AnyAsync(x => x.Pin == scenario.Pin && x.AlgorithmVersion != DemoSeries.Algorithm && x.MeasuredAt >= planned))
                 throw new InvalidOperationException($"PIN {scenario.Pin} has a newer non-demo pulse reading; preserving it conflicts with the requested demo latest scenario.");
-            var ids = DemoSeries.Samples(state.Anchor, state.Presentation).Where(x => x.Pin == scenario.Pin).Select(x => x.EnvironmentClientId).ToArray();
+            var ids = DemoSeries.Samples(state.Presentation).Where(x => x.Pin == scenario.Pin).Select(x => x.EnvironmentClientId).ToArray();
             if (await db.EnvironmentReadings.AnyAsync(x => x.Pin == scenario.Pin && !ids.Contains(x.ClientReadingId) && x.MeasuredAt >= planned))
                 throw new InvalidOperationException($"PIN {scenario.Pin} has a newer non-demo cabin reading; preserving it conflicts with the requested demo latest scenario.");
         }
     }
 
-    private static async Task EnsurePairAsync(ApiDbContext db, DemoState state, string statePath)
+    private static async Task EnsurePairAsync(ApiDbContext db, DemoState state, bool allowCreate)
     {
         if (state.UnoId is not null && state.CameraId is not null)
         {
-            if (state.OwnsPair)
+            var uno = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == state.UnoId);
+            var camera = await db.Devices.SingleOrDefaultAsync(x => x.DeviceId == state.CameraId);
+            // Normal startup disables unconfigured devices. Reactivate only the
+            // isolated demo pair, never an installed device or its credentials.
+            var isolated = state.UnoId == "astra-presentation-uno-v1" && state.CameraId == "astra-presentation-camera-v1"
+                || state.UnoId.StartsWith("astra-demo-uno-", StringComparison.Ordinal) && state.CameraId.StartsWith("astra-demo-camera-", StringComparison.Ordinal);
+            if (allowCreate && isolated && uno is { Kind: "uno" } && camera is { Kind: "camera" }
+                && uno.PairedDeviceId == camera.DeviceId && camera.PairedDeviceId == uno.DeviceId)
             {
-                var owned = await db.Devices.Where(x => x.DeviceId == state.UnoId || x.DeviceId == state.CameraId).ToListAsync();
-                if (owned.Count != 2 || state.UnoKey is null || state.CameraKey is null) throw new InvalidOperationException("Owned demo pair is incomplete; installed credentials will not be overwritten.");
-                var ownedHasher = new PasswordHasher<DeviceRegistration>();
-                foreach (var device in owned)
-                {
-                    var secret = device.DeviceId == state.UnoId ? state.UnoKey : state.CameraKey;
-                    if (ownedHasher.VerifyHashedPassword(device, device.CredentialHash, secret) == PasswordVerificationResult.Failed)
-                        throw new InvalidOperationException("Owned demo credentials changed; refusing to overwrite them.");
-                    device.Active = true;
-                }
+                if (await db.Measurements.AnyAsync(x => (x.UnoDeviceId == uno.DeviceId || x.CameraDeviceId == camera.DeviceId)
+                    && x.AlgorithmVersion != DemoSeries.Algorithm))
+                    throw new InvalidOperationException("The isolated demo pair is used by non-demo data; refusing to change it.");
+                var demoCabinIds = DemoSeries.Samples(state.Presentation).Select(x => x.EnvironmentClientId).ToArray();
+                if (await db.EnvironmentReadings.AnyAsync(x => x.DeviceId == uno.DeviceId && !demoCabinIds.Contains(x.ClientReadingId)))
+                    throw new InvalidOperationException("The isolated demo pair is used by non-demo cabin data; refusing to change it.");
+                uno.Active = camera.Active = true;
                 await db.SaveChangesAsync();
             }
             if (!await db.Devices.AnyAsync(x => x.DeviceId == state.UnoId && x.Kind == "uno" && x.Active && x.PairedDeviceId == state.CameraId)
                 || !await db.Devices.AnyAsync(x => x.DeviceId == state.CameraId && x.Kind == "camera" && x.Active && x.PairedDeviceId == state.UnoId))
-                throw new InvalidOperationException("The saved demo device pair is no longer active; no installed credentials will be overwritten.");
+                throw new InvalidOperationException("The demo readings' device pair is inactive or invalid; installed credentials will not be changed.");
             return;
         }
         var pair = await (from camera in db.Devices.AsNoTracking() join uno in db.Devices.AsNoTracking() on camera.PairedDeviceId equals uno.DeviceId
             where camera.Active && uno.Active && camera.Kind == "camera" && uno.Kind == "uno" && uno.PairedDeviceId == camera.DeviceId
             select new { Camera = camera.DeviceId, Uno = uno.DeviceId }).FirstOrDefaultAsync();
         if (pair is not null) { state.UnoId = pair.Uno; state.CameraId = pair.Camera; return; }
-        state.UnoId = "astra-presentation-uno-v1"; state.CameraId = "astra-presentation-camera-v1";
-        if (await db.Devices.AnyAsync(x => x.DeviceId == state.UnoId || x.DeviceId == state.CameraId))
-            throw new InvalidOperationException("Isolated demo device IDs already exist without a valid saved pair; refusing to overwrite credentials.");
+        if (!allowCreate) throw new InvalidOperationException("No active demo pair exists. Run prepare first.");
+        state.UnoId = "astra-demo-uno-" + Guid.NewGuid().ToString("N");
+        state.CameraId = "astra-demo-camera-" + Guid.NewGuid().ToString("N");
         state.OwnsPair = true;
-        state.UnoKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
-        state.CameraKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
-        state.Save(statePath);
         var unoDevice = new DeviceRegistration { DeviceId = state.UnoId, Kind = "uno", PairedDeviceId = state.CameraId, Active = true, CredentialHash = "" };
         var cameraDevice = new DeviceRegistration { DeviceId = state.CameraId, Kind = "camera", PairedDeviceId = state.UnoId, Active = true, CredentialHash = "" };
         var hasher = new PasswordHasher<DeviceRegistration>();
-        unoDevice.CredentialHash = hasher.HashPassword(unoDevice, state.UnoKey);
-        cameraDevice.CredentialHash = hasher.HashPassword(cameraDevice, state.CameraKey);
+        unoDevice.CredentialHash = hasher.HashPassword(unoDevice, Convert.ToBase64String(RandomNumberGenerator.GetBytes(48)));
+        cameraDevice.CredentialHash = hasher.HashPassword(cameraDevice, Convert.ToBase64String(RandomNumberGenerator.GetBytes(48)));
         db.Devices.AddRange(unoDevice, cameraDevice); await db.SaveChangesAsync();
         Console.WriteLine("Configured an isolated hashed-credential demo Uno/camera pair; installed device credentials are unchanged.");
     }
-
     private static async Task RefreshAsync(ApiDbContext db, DemoState state)
     {
         var now = DateTimeOffset.UtcNow;
@@ -186,7 +172,7 @@ public static class DemoRunner
 
     private static async Task AlignAsync(ApiDbContext db, DemoState state, DateTimeOffset presentation, bool requireComplete)
     {
-        var samples = DemoSeries.Samples(state.Anchor, presentation).ToList();
+        var samples = DemoSeries.Samples(presentation).ToList();
         var pulseIds = samples.Select(x => x.MeasurementClientId).ToArray();
         var cabinIds = samples.Select(x => x.EnvironmentClientId).ToArray();
         await using var tx = await db.Database.BeginTransactionAsync();

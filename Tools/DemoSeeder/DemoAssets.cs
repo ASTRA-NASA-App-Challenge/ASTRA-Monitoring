@@ -12,7 +12,7 @@ public static class DemoAssets
         Directory.CreateDirectory(destination);
         foreach (var scenario in DemoSeries.Scenarios)
         {
-            using var image = Image.Load(Path.Combine(root, ".demo", "raw-portraits-v1", scenario.Pin + ".png"));
+            using var image = Image.Load(Path.Combine(root, "bin", "raw-portraits-v1", scenario.Pin + ".png"));
             image.Mutate(x => x.AutoOrient().Resize(new ResizeOptions { Size = new Size(320, 240), Mode = ResizeMode.Crop }));
             image.SaveAsJpeg(Path.Combine(destination, scenario.Pin + ".jpg"), new JpegEncoder { Quality = 90 });
         }

@@ -63,7 +63,11 @@ In Development, run `dotnet run -- --seed-pin=123456` to create seven synthetic 
 
 ## Verification
 
-The complete six-PIN presentation dataset has an explicitly invoked tool, real private portraits, and a separate latest-reading refresh command. See [Tools/DemoSeeder/README.md](Tools/DemoSeeder/README.md).
+In Development, start Monitoring and then the web app. Monitoring waits for the web app to register the six demo PINs, then automatically seeds any missing histories and private photos in the background. No terminal seeding commands are required. Monitoring does not create web accounts or register the demo PINs itself. Demo preparation resumes using existing SQLite readings and stable sample IDs. No demo anchors, manifests or reports are persisted, and no `.demo` folder is created. Deleting SQLite also removes the previous demo data. Complete datasets are reused; non-demo data and retired identities are never reset. Set `Demo__SeedOnStartup=false` to disable automatic preparation. It is disabled by default outside Development. Preparation requires the .NET SDK and the `Tools/DemoSeeder` project.
+
+The separate refresh command shifts the demo timeline while preserving six-hour check-in spacing across 31 days. Restarting the server does not refresh an existing dataset. The server project exposes DemoSeeder source files as non-compiling items so they remain visible in Rider. Optionally, open `ASTRA-Monitoring.slnx` to load the server, DemoSeeder and tests as separate projects.
+
+Ground control sees a Development-only progress banner in the web app, including history and photo counts, verification, retries and a completion notice. Use its **Refresh data** button once preparation finishes. The web proxies the authenticated `/api/v1/demo/status` endpoint; no server key reaches the browser. Non-photo history uses bounded batches on the private loopback seed host, with the same validation and creation handlers as individual requests. Photo creation and uploads continue through the normal endpoints and five-minute upload window.
 
 ```powershell
 dotnet run --project Tools/DemoSeeder --artifacts-path ./bin/demo-build -- prepare

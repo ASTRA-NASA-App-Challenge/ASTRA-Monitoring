@@ -1,31 +1,35 @@
-using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using MonitoringApi.Data;
 
 namespace Astra.Demo;
 
 public sealed class DemoState
 {
-    public int Version { get; set; } = 1;
-    public DateTimeOffset Anchor { get; set; }
     public DateTimeOffset Presentation { get; set; }
     public string? UnoId { get; set; }
     public string? CameraId { get; set; }
-    public string? UnoKey { get; set; }
-    public string? CameraKey { get; set; }
     public bool OwnsPair { get; set; }
-    public bool Prepared { get; set; }
-    public int CadenceVersion { get; set; }
+    public bool IsNew { get; set; }
     public Dictionary<string, string> AssetHashes { get; set; } = [];
 
-    public static DemoState Load(string path) => File.Exists(path)
-        ? JsonSerializer.Deserialize<DemoState>(File.ReadAllText(path)) ?? throw new InvalidOperationException("Invalid demo state.")
-        : new DemoState { Anchor = DateTimeOffset.UtcNow, Presentation = DateTimeOffset.UtcNow };
-
-    public void Save(string path)
+    // Per-run context only. Resume from actual readings, without a saved time anchor.
+    public static async Task<DemoState> FromDatabaseAsync(ApiDbContext db)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        var temp = path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(temp, path, true);
-        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var rows = await db.Measurements.AsNoTracking().Where(x => x.AlgorithmVersion == DemoSeries.Algorithm)
+            .ToDictionaryAsync(x => x.ClientMeasurementId);
+        var samples = DemoSeries.Samples(DateTimeOffset.UtcNow).OrderBy(x => x.Slot).ToList();
+        var cabinKeys = samples.Select(x => x.EnvironmentClientId).ToArray();
+        var cabins = await db.EnvironmentReadings.AsNoTracking().Where(x => cabinKeys.Contains(x.ClientReadingId))
+            .ToDictionaryAsync(x => x.ClientReadingId);
+        foreach (var sample in samples)
+        {
+            var scenario = DemoSeries.Scenarios.Single(x => x.Pin == sample.Pin);
+            if (rows.TryGetValue(sample.MeasurementClientId, out var row) && row.Pin == sample.Pin)
+                return new DemoState { Presentation = row.MeasuredAt.AddMinutes(scenario.AgeMinutes).AddHours(6 * sample.Slot),
+                    UnoId = row.UnoDeviceId, CameraId = row.CameraDeviceId };
+            if (cabins.TryGetValue(sample.EnvironmentClientId, out var cabin) && cabin.Pin == sample.Pin)
+                return new DemoState { Presentation = cabin.MeasuredAt.AddMinutes(scenario.AgeMinutes).AddHours(6 * sample.Slot) };
+        }
+        return new DemoState { Presentation = DateTimeOffset.UtcNow, IsNew = true };
     }
 }
